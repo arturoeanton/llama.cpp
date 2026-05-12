@@ -545,9 +545,9 @@ int main(int argc, char ** argv) {
 
         LOG("\n");
         LOG("=======================================================================\n");
-        LOG("  This is intentionally slow. It proves a 35GB 70B model can run\n");
-        LOG("  with a reduced memory footprint (~%d GB peak instead of full RAM).\n", 11);
-        LOG("  Each turn: %d tokens, ~%d seconds. KV is reset every turn.\n", n_predict, n_predict * 20);
+        LOG("  Slotted-real chat loop. Each turn streams non-resident slots from\n");
+        LOG("  disk; expect wall-clock-dominated latency. KV is reset every turn.\n");
+        LOG("  Each turn: %d tokens.\n", n_predict);
         LOG("  Type a prompt and press Enter. Empty line / Ctrl-D exits.\n");
         LOG("=======================================================================\n");
 
