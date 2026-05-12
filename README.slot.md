@@ -298,6 +298,7 @@ These flags live in `common/arg.cpp` and are CLI-only (`LLAMA_EXAMPLE_CLI`).
 | `--slotted-decode-baseline` | Run normal `llama_decode` on the same prompt and sampling for comparison. |
 | `--slotted-chat-poc` | Interactive chat loop using the slotted-real runtime. Used by `poc.c`. |
 | `--slotted-round-robin` | Opt out of the default pin-and-scratch hot-swap policy and use the legacy round-robin one (pool_idx = slot_idx % R). See "Hot-swap pool policy" below. |
+| `--slotted-async-prefetch` | Experimental (FASE 4C): enable a single background worker thread that loads slot K+1 into the alternate pool while slot K is computing. Requires `--slotted-round-robin` and `slots_resident >= 2`; ignored otherwise. See "FASE 4C: async prefetch experiment" below. |
 
 ## Hot-swap pool policy
 
@@ -336,6 +337,61 @@ keeping both sets of pool pages hot in the CPU cache. Pin-and-scratch only
 ever writes to pool `R-1` after init, so the pinned pool's pages can stay
 cold and there is less cache competition on the write side.
 
+## FASE 4C: async prefetch experiment (round-robin only)
+
+**Goal.** Evaluate whether overlapping I/O and compute, via a single
+background prefetch worker on the round-robin policy, could close the
+gap to (or beat) the pin-and-scratch sync default.
+
+**Setup.** Same workload as the FASE 4A-2b benchmark above (Llama 3.1 70B
+Q3_K_XL, `--slot-layers 10`, `--slots-resident 2`, `-n 8`, prompt "The
+capital of France is"). A single std::thread consumes (slot_idx, pool_idx)
+jobs from a queue and pre-loads slots into the alternate pool buffer
+while the main thread is computing the current one. With round-robin and
+`R=2` the two pools alternate cleanly, so the technique requires **no
+extra memory**. At every pass boundary the decoder cross-primes the
+worker with the next pass's first slots. Opt-in via
+`--slotted-async-prefetch`; ignored unless `--slotted-round-robin` is
+also set and `slots_resident >= 2`.
+
+**Result.**
+
+| Configuration | Real time | Δ vs pin-scratch sync | Output |
+|---|---:|---:|---|
+| pin-and-scratch sync (run 1)            | 160.45 s | —              | `a city of love, art, fashion` |
+| pin-and-scratch sync (control)          | 155.20 s | -3.3% (noise)  | identical |
+| round-robin sync                        | 189.99 s | +18.4%         | identical |
+| **round-robin + async-prefetch**        | **173.51 s** | **+9.0%**  | identical |
+
+Pin-and-scratch sync averages ~157.8 s; the two-run spread is 5 s, which
+is the noise floor on this machine. Peak memory footprint is ~11.36 GB
+across all four configurations; OS swaps and block I/O are zero
+everywhere.
+
+**Conclusion.** Async-prefetch does what it should -- it cuts ~16.5 s
+(~8.7%) off round-robin sync, proving real overlap between I/O and
+compute. But pin-and-scratch sync still wins by ~16 s (~10%) because it
+performs *less total I/O per pass* (the pinned pool never reloads), and
+the parallelism win on the smaller-I/O round-robin variant does not
+close that gap. Wall-clock here is bound by total memcpy bandwidth, not
+by compute latency, so making compute and I/O concurrent helps only up
+to the point where total I/O bytes is the same.
+
+Implementation is correct (identical output across runs, no extra peak
+memory) so the flag stays in the tree as an experimental opt-in.
+
+**Flag status after FASE 4C:**
+- Default: **pin-and-scratch sync** (unchanged since FASE 4A-2b).
+- `--slotted-round-robin`: opt out of the default; legacy / A-B comparison.
+- `--slotted-async-prefetch`: experimental; requires `--slotted-round-robin`.
+  Ignored otherwise.
+
+**Not retried on 405B.** Each 405B token is ~138 s and the I/O is ~92%
+of that, so the upper-bound overlap saving is < 8 s per pass -- below
+measurement noise on that configuration. The next compute-side gain is
+expected from FASE 4B Iter B (hand-written NEON kernels), not from
+prefetch.
+
 ## Files
 
 ```
@@ -368,6 +424,7 @@ poc.c                                        # demo launcher (root of repo)
 | FASE 4A-2a | Per-slot graph execution, all slots loaded. | Top-1 token and logit match the monolithic baseline bit-for-bit, validated over 16 tokens. |
 | FASE 4A-2b | Hot-swap + 1 token with `slots_resident=2`. | Works on Llama 3.1 70B Q3_K_XL (35 GB → 11 GB peak); blocked on Gemma 4 31B by layer-structure heterogeneity. |
 | FASE 4A-3 | Multi-shard GGUFs + mixed-quant per-layer types. | Works on Llama 3.1 Tulu-3 405B Q3_K_M (~200 GB across 5 shards → 12.6 GB peak on 24 GB M4). |
+| FASE 4C | Async-prefetch worker on round-robin: overlap I/O with compute. | Implemented and validated; gains ~9% vs round-robin sync but does not beat the pin-and-scratch sync default (173.5 s vs 157.8 s avg on 70B). Kept as opt-in `--slotted-async-prefetch`. |
 | FASE 4B | M4 kernel lab (microbenchmark). | Designed, not implemented yet. |
 | FASE 5 | True eviction with per-slot tensor recreation. | Out of scope for this round. |
 
