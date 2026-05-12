@@ -1,10 +1,9 @@
 /*
  * poc_tulu.c -- slotted-real demo launcher for Llama 3.1 Tulu-3 405B Q3_K_M.
  *
- * Sibling of poc.c (which targets the 70B Q3_K_XL). Same idea: hardcode every
- * flag llama-cli needs so a single `./poc_tulu` boots the slotted-real chat
- * demo on a multi-shard 405B model with a peak memory footprint of ~12.6 GB
- * on a 24 GB MacBook Air M4.
+ * Hardcodes every flag llama-cli needs so a single `./poc_tulu` boots the
+ * slotted-real chat demo on the multi-shard 405B model with a peak memory
+ * footprint of ~12.6 GB on a 24 GB MacBook Air M4.
  *
  * Compiles with:
  *     clang poc_tulu.c -o poc_tulu
@@ -78,11 +77,11 @@ int main(int argc, char ** argv) {
         "  Mode:      CPU only, --no-mmap, --no-repack\n"
         "  Slot plan: 42 slots x 3 layers,  --slots-resident 2\n"
         "\n"
-        "  This is much slower than the 70B PoC (~138 s/token on a 24 GB M4).\n"
-        "  Goal: peak memory footprint ~12.6 GB even though the model file is\n"
-        "  ~200 GB on disk.  Multi-shard + mixed-quant fixes (FASE 4A-3) make\n"
-        "  this work.  Each turn generates the requested number of tokens then\n"
-        "  waits for the next prompt.  KV cache is reset between turns.\n"
+        "  Expect ~138 s/token on a 24 GB M4.  Goal: peak memory footprint\n"
+        "  ~12.6 GB even though the model file is ~200 GB on disk.\n"
+        "  Multi-shard + mixed-quant fixes (FASE 4A-3) make this work.\n"
+        "  Each turn generates the requested number of tokens then waits for\n"
+        "  the next prompt.  KV cache is reset between turns.\n"
         "=========================================================================\n"
         "\n",
         stderr);
