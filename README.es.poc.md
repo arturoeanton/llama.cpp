@@ -164,37 +164,42 @@ cache del OS absorbe la mayoría; `block input operations` debería quedarse baj
 Para un walkthrough más profundo de qué hace cada pieza, leer
 [`README.es.slot.md`](README.es.slot.md).
 
-## Más allá del launcher: Llama 3.1 405B Q3_K_M
+## Launcher hermano: `poc_tulu.c` (Llama 3.1 405B Q3_K_M)
 
-El launcher `poc.c` tiene hardcodeado el path del 70B y su slot plan,
-pero el mismo binario `llama-cli` ahora también corre **Llama 3.1
-Tulu-3 405B Q3_K_M** (~200 GB en 5 shards) en el mismo hardware M4 de
-24 GB, con un peak memory footprint de **~12.6 GB**. Esto se habilitó
-con FASE 4A-3 (soporte multi-shard + mixed-quant en
-`src/llama-slotted-runtime.{h,cpp}`).
+`poc.c` apunta al 70B Q3_K_XL. Un launcher hermano, `poc_tulu.c`, apunta
+el mismo binario `llama-cli` a **Llama 3.1 Tulu-3 405B Q3_K_M** (~200 GB
+en 5 shards), con peak memory footprint de **~12.6 GB** en una MacBook
+Air M4 de 24 GB. Esto se habilitó con FASE 4A-3 (soporte multi-shard +
+mixed-quant en `src/llama-slotted-runtime.{h,cpp}`).
 
-El run se lanza sin `poc.c`, llamando directo a `llama-cli` con el
-primer shard:
+Compilar y correr:
 
 ```bash
-# apuntar M al shard *-00001-of-00005.gguf;
-# el runtime descubre los otros 4 desde split.count.
-M=$(ls ~/models/llama31-405b-tulu-q3km/.../Llama-3.1-Tulu-3-405B-Q3_K_M-00001-of-00005.gguf)
-
-echo "The capital of France is" | /usr/bin/time -l ./build/bin/llama-cli \
-  -m "$M" \
-  --n-gpu-layers 0 --no-mmap --no-warmup \
-  --ctx-size 128 --batch-size 8 --ubatch-size 8 \
-  --slot-layers 3 --slotted-real --slots-resident 2 \
-  --slotted-chat-poc -n 4 --verbosity 4
+clang poc_tulu.c -o poc_tulu
+./poc_tulu          # 4 tokens por turno (default, ~9 min en M4 24 GB)
+./poc_tulu 8        # 8 tokens por turno (~20 min)
+./poc_tulu 1        # 1 token (smoke test)
 ```
+
+`poc_tulu` espera el shard 1 del modelo en
+`$HOME/models/llama31-405b-tulu-q3km/Llama-3.1-Tulu-3-405B-Q3_K_M/Llama-3.1-Tulu-3-405B-Q3_K_M-00001-of-00005.gguf`,
+con los otros 4 shards al lado. El runtime descubre los demás desde la
+metadata key `split.count`, así que sólo se pasa el path del shard 1 al
+`llama-cli`. Editá `MODEL_REL` arriba de `poc_tulu.c` para apuntar a
+otra ruta.
+
+Los flags hardcodeados difieren de `poc.c` solo en el slot plan:
+
+| Flag | `poc` (70B) | `poc_tulu` (405B) | Razón |
+|---|---|---|---|
+| `--slot-layers` | 10 | 3 | 80 / 10 = 8 slots vs 126 / 3 = 42 slots. Uniformes. |
+| Default `-n` | 16 | 4 | El 405B va a ~138 s/token; los defaults apuntan a un budget similar de wall-clock por turno. |
 
 Trade-off vs 70B: ~138 s/token en vez de ~20-30 s/token, porque cada
 forward pass re-lee decenas de GB de pesos y el hit rate del page cache
 es menor con un working set de 200 GB contra 24 GB de RAM. La latencia
-es intencional; el objetivo de esta configuración es demostrar que la
-ejecución por slots escala a modelos clase 405B en hardware de consumo,
-no ser rápido.
+es intencional; el objetivo es demostrar que la ejecución por slots
+escala a modelos clase 405B en hardware de consumo, no ser rápido.
 
 Ver [`README.es.slot.md`](README.es.slot.md), sección "Llama 3.1 Tulu-3
 405B Q3_K_M (FASE 4A-3)" para la tabla completa de mediciones.
