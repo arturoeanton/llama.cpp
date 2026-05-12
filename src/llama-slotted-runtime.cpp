@@ -7,9 +7,11 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -38,6 +40,114 @@ bool parse_blk(const std::string & name, int & out_il, std::string & out_rest) {
 
 inline double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Recompute nb[] for a row-major dense tensor whose `type` and `ne[]` are set.
+// This mirrors the convention ggml uses for tensors with quant blocks along
+// dim 0: nb[0] = type_size, nb[1] = nelems_row / block_size * type_size, etc.
+void recompute_nb_for_type(ggml_tensor * t) {
+    const enum ggml_type ty = (enum ggml_type) t->type;
+    const int64_t blck = ggml_blck_size(ty);
+    const size_t  tsz  = ggml_type_size(ty);
+    if (blck <= 0 || tsz == 0) return;
+    t->nb[0] = tsz;
+    t->nb[1] = (size_t)((t->ne[0] / blck) * tsz);
+    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+        t->nb[d] = t->nb[d - 1] * (size_t) t->ne[d - 1];
+    }
+}
+
+// Discover all shards for a possibly-split GGUF path. Returns a list with at
+// least the input path (if not a split file) or every shard path (if split).
+// On any parse / open / metadata error we return a single-element vector
+// containing just the original path and let the caller proceed -- if it's not
+// actually a split it'll just look like a 1-shard model.
+std::vector<std::string> discover_shards(const std::string & path) {
+    std::vector<std::string> out;
+
+    // Open the user-supplied path, read split metadata.
+    struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gp);
+    if (gctx == nullptr) {
+        out.push_back(path);
+        return out;
+    }
+    uint16_t n_split = 0;
+    {
+        const int kid = gguf_find_key(gctx, "split.count");
+        if (kid >= 0) {
+            n_split = gguf_get_val_u16(gctx, kid);
+        }
+    }
+    uint16_t this_idx = 0;
+    {
+        const int kid = gguf_find_key(gctx, "split.no");
+        if (kid >= 0) {
+            this_idx = gguf_get_val_u16(gctx, kid);
+        }
+    }
+    gguf_free(gctx);
+
+    if (n_split <= 1) {
+        out.push_back(path);
+        return out;
+    }
+
+    // Derive the prefix from the input path using llama's helper, then
+    // synthesise each shard path. We assume the caller passed shard 0.
+    constexpr size_t BUF = 4096;
+    std::vector<char> buf(BUF, 0);
+    int pre_len = llama_split_prefix(buf.data(), buf.size(), path.c_str(),
+                                     (int32_t) this_idx, (int32_t) n_split);
+    if (pre_len <= 0) {
+        LLAMA_LOG_WARN("slotted: split.count=%u but llama_split_prefix failed on '%s'; "
+                       "falling back to single-shard\n", (unsigned) n_split, path.c_str());
+        out.push_back(path);
+        return out;
+    }
+    const std::string prefix(buf.data(), (size_t) pre_len);
+
+    out.reserve((size_t) n_split);
+    for (int32_t i = 0; i < (int32_t) n_split; ++i) {
+        int n = llama_split_path(buf.data(), buf.size(), prefix.c_str(), i, (int32_t) n_split);
+        if (n <= 0) {
+            LLAMA_LOG_WARN("slotted: llama_split_path failed for idx=%d / %u\n",
+                           i, (unsigned) n_split);
+            // Best effort: fall back to single shard.
+            out.clear();
+            out.push_back(path);
+            return out;
+        }
+        out.emplace_back(buf.data(), (size_t) n);
+    }
+
+    LLAMA_LOG_INFO("slotted: discovered %u shard(s) for '%s'\n", (unsigned) n_split, path.c_str());
+    return out;
+}
+
+// Snapshot the original (loader-allocated) metadata for each pool tensor so
+// destroy() can restore. Stores type, nb, data pointer keyed by tensor.
+void snapshot_pool_tensor_metadata(slotted_hot_swap_state & st) {
+    for (int p = 0; p < st.slots_resident; ++p) {
+        const int il_start = st.slot_ranges[p].first;
+        const int il_end   = st.slot_ranges[p].second;
+
+        for (const auto & kv : st.model->tensors_by_name) {
+            const std::string & name = kv.first;
+            ggml_tensor * t = kv.second;
+            int il = -1;
+            std::string suffix;
+            if (!parse_blk(name, il, suffix)) continue;
+            if (il < il_start || il > il_end)  continue;
+
+            st.initial_alloc_size[t] = ggml_nbytes(t);
+            st.initial_type[t]       = (int) t->type;
+            std::array<size_t, GGML_MAX_DIMS> nb{};
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) nb[d] = t->nb[d];
+            st.initial_nb[t]   = nb;
+            st.initial_data[t] = t->data;
+        }
+    }
 }
 
 } // namespace
@@ -73,45 +183,64 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
     }
 
     st.model           = model;
-    st.gguf_path       = gguf_path;
     st.slot_ranges     = slot_ranges;
     st.slots_resident  = slots_resident;
     st.policy          = policy;
 
-    // Open GGUF read-only (separate fd from the loader's mmap/fread).
-    st.gguf_fd = ::open(gguf_path.c_str(), O_RDONLY);
-    if (st.gguf_fd < 0) {
-        LLAMA_LOG_ERROR("%s: open('%s') failed\n", __func__, gguf_path.c_str());
-        return false;
-    }
-    struct stat sb{};
-    if (::fstat(st.gguf_fd, &sb) < 0 || sb.st_size <= 0) {
-        LLAMA_LOG_ERROR("%s: fstat failed\n", __func__);
-        ::close(st.gguf_fd);
-        st.gguf_fd = -1;
-        return false;
-    }
-    st.gguf_file_size = (uint64_t) sb.st_size;
+    // Discover all shards (single-file → 1 entry).
+    st.gguf_paths = discover_shards(gguf_path);
+    st.gguf_fds.assign(st.gguf_paths.size(), -1);
+    st.gguf_data_bases.assign(st.gguf_paths.size(), 0);
 
-    // Read tensor metadata + the data-base offset via gguf_init_from_file.
-    // We use no_alloc=true: we just want offsets, not buffers.
-    {
-        struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
-        gguf_context * gctx = gguf_init_from_file(gguf_path.c_str(), gp);
-        if (gctx == nullptr) {
-            LLAMA_LOG_ERROR("%s: gguf_init_from_file failed\n", __func__);
-            ::close(st.gguf_fd);
-            st.gguf_fd = -1;
+    // Open each shard read-only and build the unified tensor map.
+    for (size_t s = 0; s < st.gguf_paths.size(); ++s) {
+        const std::string & p = st.gguf_paths[s];
+        st.gguf_fds[s] = ::open(p.c_str(), O_RDONLY);
+        if (st.gguf_fds[s] < 0) {
+            LLAMA_LOG_ERROR("%s: open('%s') failed for shard %zu\n", __func__, p.c_str(), s);
+            // Cleanup partial state.
+            for (size_t k = 0; k < s; ++k) {
+                if (st.gguf_fds[k] >= 0) ::close(st.gguf_fds[k]);
+                st.gguf_fds[k] = -1;
+            }
             return false;
         }
-        st.gguf_data_base = gguf_get_data_offset(gctx);
+        struct stat sb{};
+        if (::fstat(st.gguf_fds[s], &sb) < 0 || sb.st_size <= 0) {
+            LLAMA_LOG_ERROR("%s: fstat failed on shard %zu ('%s')\n", __func__, s, p.c_str());
+            ::close(st.gguf_fds[s]);
+            st.gguf_fds[s] = -1;
+            return false;
+        }
+
+        struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        gguf_context * gctx = gguf_init_from_file(p.c_str(), gp);
+        if (gctx == nullptr) {
+            LLAMA_LOG_ERROR("%s: gguf_init_from_file failed on shard %zu ('%s')\n",
+                            __func__, s, p.c_str());
+            return false;
+        }
+        st.gguf_data_bases[s] = gguf_get_data_offset(gctx);
+
         const int64_t n_tensors = gguf_get_n_tensors(gctx);
-        st.gguf_tensors.reserve((size_t) n_tensors);
         for (int64_t i = 0; i < n_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(gctx, i);
-            const size_t off  = gguf_get_tensor_offset(gctx, i);
-            const size_t sz   = gguf_get_tensor_size(gctx, i);
-            st.gguf_tensors.emplace(std::string(name), std::make_pair((uint64_t) off, (uint64_t) sz));
+            const char *      name = gguf_get_tensor_name(gctx, i);
+            const size_t      off  = gguf_get_tensor_offset(gctx, i);
+            const size_t      sz   = gguf_get_tensor_size(gctx, i);
+            const enum ggml_type tt = gguf_get_tensor_type(gctx, i);
+
+            gguf_tensor_loc loc;
+            loc.shard_idx         = (int) s;
+            loc.off_in_shard_data = (uint64_t) off;
+            loc.size              = (uint64_t) sz;
+            loc.type              = (int) tt;
+            // First wins (shouldn't collide across shards since the loader
+            // forbids duplicates; if it does, log and ignore the dup).
+            auto ins = st.gguf_tensors.emplace(std::string(name), loc);
+            if (!ins.second) {
+                LLAMA_LOG_WARN("%s: tensor '%s' present in multiple shards; using shard %d\n",
+                               __func__, name, ins.first->second.shard_idx);
+            }
         }
         gguf_free(gctx);
     }
@@ -130,16 +259,23 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
         }
     }
 
+    // Snapshot per-tensor metadata so destroy() can restore.
+    snapshot_pool_tensor_metadata(st);
+
     const char * policy_name = (policy == SLOTTED_POOL_PIN_SCRATCH) ? "pin-scratch" : "round-robin";
-    LLAMA_LOG_INFO("%s: hot-swap state ready: gguf='%s' fd=%d data_off=%llu tensors=%zu pools=%d policy=%s\n",
-            __func__, gguf_path.c_str(), st.gguf_fd,
-            (unsigned long long) st.gguf_data_base, st.gguf_tensors.size(), slots_resident, policy_name);
+    LLAMA_LOG_INFO("%s: hot-swap state ready: shards=%zu tensors=%zu pools=%d policy=%s\n",
+            __func__, st.gguf_paths.size(), st.gguf_tensors.size(), slots_resident, policy_name);
+    for (size_t s = 0; s < st.gguf_paths.size(); ++s) {
+        LLAMA_LOG_INFO("%s:   shard[%zu]: fd=%d data_off=%llu path='%s'\n",
+                __func__, s, st.gguf_fds[s],
+                (unsigned long long) st.gguf_data_bases[s], st.gguf_paths[s].c_str());
+    }
 
     return true;
 }
 
 bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int pool_idx) {
-    if (st.model == nullptr || st.gguf_fd < 0) {
+    if (st.model == nullptr || st.gguf_fds.empty()) {
         LLAMA_LOG_ERROR("%s: state not initialized\n", __func__);
         return false;
     }
@@ -172,21 +308,17 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
     LLAMA_LOG_INFO("%s: swapping logical slot %d (layers %d..%d) into pool %d (phys %d..%d)\n",
             __func__, slot_idx, log_start, log_end, pool_idx, phy_start, phy_end);
 
-    // For every tensor in tensors_by_name belonging to a physical layer in this
-    // pool, find its logical-slot counterpart in the GGUF and stream its bytes
-    // into the pool's tensor buffer.
     const auto & pool_initial = st.pool_initial_layers[pool_idx];
 
     uint64_t bytes_this_swap = 0;
     int      tensors_touched = 0;
+    int      tensors_retyped = 0;
+    int      tensors_resized = 0;
     double   read_ms_this    = 0.0;
     double   set_ms_this     = 0.0;
     constexpr size_t CHUNK   = 1u << 20; // 1 MiB scratch buffer
     std::vector<uint8_t> scratch(CHUNK);
 
-    // For fast lookup of the pool's tensors by physical layer index + suffix,
-    // we'll iterate tensors_by_name and pick out the ones with the expected
-    // "blk.<phy>.*" prefix. For each, derive the logical name and stream bytes.
     const auto & tensors = st.model->tensors_by_name;
 
     for (const auto & kv : tensors) {
@@ -206,45 +338,80 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
 
         auto it = st.gguf_tensors.find(log_name);
         if (it == st.gguf_tensors.end()) {
-            // Some tensors may be optional / present only for certain layers (e.g. rope_freqs
-            // is non-SWA-only, expert tensors, etc.). If the destination has data but the
-            // source doesn't, that's a real problem. If both are absent, fine. For FASE 4A-2b
-            // we conservatively warn and skip.
-            LLAMA_LOG_WARN("%s: source tensor '%s' not found in GGUF (skipping)\n", __func__, log_name);
+            // Genuinely absent from the GGUF (across all shards). For optional
+            // tensors (rope_freqs etc.) this is fine; if the graph needs it,
+            // we'll crash later anyway.
+            LLAMA_LOG_WARN("%s: source tensor '%s' not found in GGUF (skipping)\n",
+                           __func__, log_name);
             continue;
         }
-        const uint64_t src_off  = st.gguf_data_base + it->second.first;
-        const uint64_t src_size = it->second.second;
+        const gguf_tensor_loc & loc = it->second;
+        if (loc.shard_idx < 0 || loc.shard_idx >= (int) st.gguf_fds.size()) {
+            LLAMA_LOG_ERROR("%s: bogus shard_idx=%d for '%s'\n", __func__, loc.shard_idx, log_name);
+            return false;
+        }
+        const int      fd       = st.gguf_fds[loc.shard_idx];
+        const uint64_t src_off  = st.gguf_data_bases[loc.shard_idx] + loc.off_in_shard_data;
+        const uint64_t src_size = loc.size;
+        const enum ggml_type src_type = (enum ggml_type) loc.type;
 
-        const size_t dst_size = ggml_nbytes(dst_tensor);
-        if (src_size != dst_size) {
-            // FASE 4A-2b discovery: Gemma 4 31B has heterogeneous layers (MoE
-            // pattern varies). Pool-based hot-swap requires same-shape tensors
-            // across slots. For now we skip mismatched tensors with a warning
-            // and continue -- the resulting cgraph will compute on partial
-            // (stale) data and produce wrong logits. Stage 1 only verifies no
-            // crash; correctness requires a different slotting strategy.
-            LLAMA_LOG_WARN("%s: size mismatch for '%s' -> '%s': src=%llu dst=%zu (skipping)\n",
-                    __func__, log_name, name.c_str(),
-                    (unsigned long long) src_size, dst_size);
-            continue;
+        // Resolve dst's loader-allocated buffer size (snapshotted at setup).
+        size_t init_alloc = 0;
+        {
+            auto it2 = st.initial_alloc_size.find(dst_tensor);
+            init_alloc = (it2 != st.initial_alloc_size.end()) ? it2->second : ggml_nbytes(dst_tensor);
         }
 
-        // Read bytes from GGUF and write into the pool's tensor.
+        // Decide whether we need to mutate dst's type/nb (mixed-quant).
+        const bool need_retype = (src_type != (enum ggml_type) dst_tensor->type) ||
+                                 (src_size != (uint64_t) ggml_nbytes(dst_tensor));
+
+        // Decide whether we need an override buffer (src doesn't fit dst's
+        // loader allocation, or already on override and dst->data still points
+        // at a now-too-small override).
+        uint8_t * write_ptr = (uint8_t *) dst_tensor->data;
+        if (src_size > (uint64_t) init_alloc) {
+            // Use / grow the override buffer for this tensor.
+            auto & buf = st.override_bufs[dst_tensor];
+            if (buf.size() < src_size) {
+                buf.resize((size_t) src_size);
+            }
+            dst_tensor->data = buf.data();
+            write_ptr        = buf.data();
+            ++tensors_resized;
+        } else if (st.override_bufs.count(dst_tensor) != 0) {
+            // We already overrode this tensor previously and the override is
+            // big enough -- keep using it.
+            write_ptr = (uint8_t *) dst_tensor->data;
+        }
+
+        if (need_retype) {
+            // Same shape (ne[]) assumed; only type changes. Mutate type and nb.
+            dst_tensor->type = src_type;
+            recompute_nb_for_type(dst_tensor);
+            ++tensors_retyped;
+        }
+
+        // Read bytes from the right shard's fd and copy into dst's storage.
         uint64_t   bytes_done = 0;
         const auto t_read_start = std::chrono::steady_clock::now();
         while (bytes_done < src_size) {
             const size_t to_read = (size_t) std::min<uint64_t>(CHUNK, src_size - bytes_done);
-            const ssize_t n = ::pread(st.gguf_fd, scratch.data(), to_read,
+            const ssize_t n = ::pread(fd, scratch.data(), to_read,
                                        (off_t)(src_off + bytes_done));
             if (n <= 0) {
-                LLAMA_LOG_ERROR("%s: pread failed for '%s' at off=%llu (%zd)\n",
-                        __func__, log_name,
+                LLAMA_LOG_ERROR("%s: pread failed for '%s' (shard=%d) at off=%llu (%zd)\n",
+                        __func__, log_name, loc.shard_idx,
                         (unsigned long long)(src_off + bytes_done), n);
                 return false;
             }
             const auto t_set_start = std::chrono::steady_clock::now();
-            ggml_backend_tensor_set(dst_tensor, scratch.data(), bytes_done, (size_t) n);
+            // Direct memcpy when dst->data is a host pointer (override buffer
+            // or CPU backend buffer). ggml_backend_tensor_set is safer when
+            // the buffer lives on a non-CPU backend, but here we are CPU-only
+            // and we may have replaced data with a malloc'd buffer that the
+            // backend doesn't know about.
+            std::memcpy(write_ptr + bytes_done, scratch.data(), (size_t) n);
             set_ms_this += ms_since(t_set_start);
             bytes_done += (uint64_t) n;
         }
@@ -261,19 +428,15 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
         st.model->layers[log_start + i] = pool_initial[i];
     }
 
-    // Mark the previously-resident slot as no longer in this pool (its layers'
-    // model.layers[...] still reference the same tensors, whose data we just
-    // overwrote -- those slots must be hot-swapped back before being computed).
     st.pool_current_slot[pool_idx] = slot_idx;
 
-    // Stats.
     st.total_bytes_read += bytes_this_swap;
     st.total_read_ms    += read_ms_this;
     st.total_set_ms     += set_ms_this;
     st.total_swaps      += 1;
 
-    LLAMA_LOG_INFO("%s: slot=%d pool=%d tensors=%d bytes=%llu read_ms=%.2f set_ms=%.2f\n",
-            __func__, slot_idx, pool_idx, tensors_touched,
+    LLAMA_LOG_INFO("%s: slot=%d pool=%d tensors=%d retyped=%d resized=%d bytes=%llu read_ms=%.2f set_ms=%.2f\n",
+            __func__, slot_idx, pool_idx, tensors_touched, tensors_retyped, tensors_resized,
             (unsigned long long) bytes_this_swap, read_ms_this, set_ms_this);
 
     return true;
@@ -302,28 +465,29 @@ struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
         return nullptr;
     }
 
-    // Build per-layer weight totals from GGUF metadata directly. We cannot
-    // use llama_model_layer_weight_bytes() here because the model was loaded
-    // with the slotted filter active and reports 0 bytes for non-resident
-    // layers. The GGUF has all the metadata for every layer.
+    // Build per-layer weight totals from GGUF metadata, summing across all
+    // shards so the slot planner sees the full model.
     std::vector<uint64_t> per_layer(n_layer, 0);
     {
-        struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
-        gguf_context * gctx = gguf_init_from_file(gguf_path, gp);
-        if (gctx == nullptr) {
-            LLAMA_LOG_ERROR("%s: gguf_init_from_file('%s') failed for plan\n", __func__, gguf_path);
-            return nullptr;
-        }
-        const int64_t n_tensors = gguf_get_n_tensors(gctx);
-        for (int64_t i = 0; i < n_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(gctx, i);
-            int         il = -1;
-            std::string suffix;
-            if (parse_blk(name, il, suffix) && il < n_layer) {
-                per_layer[il] += gguf_get_tensor_size(gctx, i);
+        const std::vector<std::string> shards = discover_shards(std::string(gguf_path));
+        for (const auto & p : shards) {
+            struct gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+            gguf_context * gctx = gguf_init_from_file(p.c_str(), gp);
+            if (gctx == nullptr) {
+                LLAMA_LOG_ERROR("%s: gguf_init_from_file('%s') failed for plan\n", __func__, p.c_str());
+                return nullptr;
             }
+            const int64_t n_tensors = gguf_get_n_tensors(gctx);
+            for (int64_t i = 0; i < n_tensors; ++i) {
+                const char * name = gguf_get_tensor_name(gctx, i);
+                int         il = -1;
+                std::string suffix;
+                if (parse_blk(name, il, suffix) && il < n_layer) {
+                    per_layer[il] += gguf_get_tensor_size(gctx, i);
+                }
+            }
+            gguf_free(gctx);
         }
-        gguf_free(gctx);
     }
 
     std::vector<std::pair<int,int>> ranges;
@@ -383,23 +547,55 @@ void llama_slotted_hot_swap_free(struct llama_slotted_hot_swap * hs) {
 } // extern "C"
 
 void slotted_hot_swap_destroy(slotted_hot_swap_state & st) {
-    if (st.gguf_fd >= 0) {
-        ::close(st.gguf_fd);
-        st.gguf_fd = -1;
-    }
-    // Best-effort restore: put the initial layer bindings back so that any
-    // subsequent traversal of model.layers[] sees the original (potentially
-    // stale-data) pool layers rather than dangling logical-slot rebinds.
-    for (int p = 0; p < st.slots_resident; ++p) {
-        const int il_start = st.slot_ranges[p].first;
-        const int il_end   = st.slot_ranges[p].second;
-        const auto & src = st.pool_initial_layers[p];
-        for (int i = 0; i <= il_end - il_start; ++i) {
-            st.model->layers[il_start + i] = src[i];
+    // Close all shard fds.
+    for (size_t s = 0; s < st.gguf_fds.size(); ++s) {
+        if (st.gguf_fds[s] >= 0) {
+            ::close(st.gguf_fds[s]);
+            st.gguf_fds[s] = -1;
         }
     }
+
+    // Restore original (loader-allocated) tensor metadata + data pointers so
+    // that anything that traverses model.layers[] after destroy() sees the
+    // tensors as the loader left them. Override buffers (vector<uint8_t>) get
+    // freed when override_bufs goes out of scope below.
+    if (st.model != nullptr) {
+        for (const auto & kv : st.initial_type) {
+            ggml_tensor * t = kv.first;
+            t->type = (enum ggml_type) kv.second;
+        }
+        for (const auto & kv : st.initial_nb) {
+            ggml_tensor * t = kv.first;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) t->nb[d] = kv.second[d];
+        }
+        for (const auto & kv : st.initial_data) {
+            ggml_tensor * t = kv.first;
+            t->data = kv.second;
+        }
+
+        // Best-effort restore: put the initial layer bindings back so that any
+        // subsequent traversal of model.layers[] sees the original (potentially
+        // stale-data) pool layers rather than dangling logical-slot rebinds.
+        for (int p = 0; p < st.slots_resident; ++p) {
+            const int il_start = st.slot_ranges[p].first;
+            const int il_end   = st.slot_ranges[p].second;
+            const auto & src = st.pool_initial_layers[p];
+            for (int i = 0; i <= il_end - il_start; ++i) {
+                st.model->layers[il_start + i] = src[i];
+            }
+        }
+    }
+
+    st.gguf_paths.clear();
+    st.gguf_fds.clear();
+    st.gguf_data_bases.clear();
     st.gguf_tensors.clear();
     st.pool_initial_layers.clear();
     st.pool_current_slot.clear();
+    st.initial_alloc_size.clear();
+    st.initial_type.clear();
+    st.initial_nb.clear();
+    st.initial_data.clear();
+    st.override_bufs.clear();
     st.model = nullptr;
 }

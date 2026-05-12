@@ -163,6 +163,40 @@ absorbs most of this; reported `block input operations` should stay low.
 For a deeper walkthrough of what each piece does, read
 [`README.slot.md`](README.slot.md).
 
+## Beyond the launcher: Llama 3.1 405B Q3_K_M
+
+The `poc.c` launcher hardcodes the 70B model path and slot plan, but the
+same `llama-cli` binary now also runs **Llama 3.1 Tulu-3 405B Q3_K_M**
+(~200 GB across 5 shards) on the same 24 GB M4 hardware, at a peak memory
+footprint of **~12.6 GB**. This was enabled by FASE 4A-3 (multi-shard +
+mixed-quant support in `src/llama-slotted-runtime.{h,cpp}`).
+
+The run is launched without `poc.c`, by invoking `llama-cli` directly with
+the first shard:
+
+```bash
+# point M at the *-00001-of-00005.gguf shard;
+# the runtime auto-discovers the rest from split.count.
+M=$(ls ~/models/llama31-405b-tulu-q3km/.../Llama-3.1-Tulu-3-405B-Q3_K_M-00001-of-00005.gguf)
+
+echo "The capital of France is" | /usr/bin/time -l ./build/bin/llama-cli \
+  -m "$M" \
+  --n-gpu-layers 0 --no-mmap --no-warmup \
+  --ctx-size 128 --batch-size 8 --ubatch-size 8 \
+  --slot-layers 3 --slotted-real --slots-resident 2 \
+  --slotted-chat-poc -n 4 --verbosity 4
+```
+
+Trade-off vs 70B: ~138 s/token instead of ~20-30 s/token, because each
+forward pass re-reads ~tens of GB of weights and the page cache hit rate
+is lower with a 200 GB working set on 24 GB of RAM. The throughput is
+intentional; the goal of this configuration is to demonstrate that
+slot-based execution scales to 405B-class models on consumer hardware,
+not to be fast.
+
+See [`README.slot.md`](README.slot.md), section "Llama 3.1 Tulu-3 405B
+Q3_K_M (FASE 4A-3)" for the full measurement table.
+
 ## Disclosure
 
 This is experimental research code in a private fork. It is not intended for

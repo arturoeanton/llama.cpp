@@ -12,16 +12,27 @@
 // The runtime opens its own fd on the GGUF so its reads don't interact with
 // the loader's mmap or fread state.
 //
-// Constraints (FASE 4A-2b):
-//   - text-only Gemma 4
-//   - --no-repack (raw Q4_K_M bytes go straight to the buffer, no SIMD pack)
+// FASE 4A-3 extensions (to support Llama 3.1 405B Q3_K_M):
+//   - multi-shard GGUFs (-NNNNN-of-NNNNN.gguf): open every shard, build a
+//     unified tensor map name -> (shard_idx, offset, size, type).
+//   - heterogeneous quant types across logical slots (mixed-quant variants
+//     like Q3_K_M): on swap, if the source tensor's type/size differs from
+//     the pool-resident dst tensor's, mutate dst->type and dst->nb[] to match
+//     the source, and (if the source bytes don't fit the loader-allocated
+//     buffer) point dst->data at a per-tensor override buffer we own.
+//
+// Constraints still in force:
+//   - text-only Llama / Gemma 4
+//   - --no-repack (raw quant bytes go straight to the buffer, no SIMD pack)
 //   - batch_size 1
-//   - homogeneous slot layouts (all slots' per-layer tensor shapes match the
-//     pool slots' shapes -- true for Gemma 4 31B; we assert at swap time)
+//   - all logical slots must share the same per-layer *shape* (ne[]). Only
+//     the quant type may vary between layers.
 
 #include "llama.h"
 #include "llama-model.h"
+#include "ggml.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -44,19 +55,32 @@ enum slotted_hot_swap_policy_t {
     SLOTTED_POOL_PIN_SCRATCH = 1,
 };
 
+// Per-tensor location in a (possibly multi-shard) GGUF.
+//
+// `shard_idx`         index into slotted_hot_swap_state::gguf_fds.
+// `off_in_shard_data` offset relative to that shard's data section start
+//                     (i.e. add gguf_data_bases[shard_idx] to get a file offset).
+// `size`              raw tensor size in bytes (matches gguf_get_tensor_size).
+// `type`              ggml_type as stored in the GGUF (Q3_K, Q5_K, etc.).
+struct gguf_tensor_loc {
+    int       shard_idx        = 0;
+    uint64_t  off_in_shard_data = 0;
+    uint64_t  size             = 0;
+    int       type             = 0; // really enum ggml_type
+};
+
 struct slotted_hot_swap_state {
     // The model whose layer pointers will be mutated.
     llama_model * model = nullptr;
 
-    // GGUF path + fd opened with O_RDONLY for hot-swap reads.
-    std::string gguf_path;
-    int         gguf_fd        = -1;
-    uint64_t    gguf_file_size = 0;
-    uint64_t    gguf_data_base = 0; // offset where tensor data starts in GGUF
+    // Multi-shard GGUF: one entry per shard, parallel arrays. Single-file
+    // GGUFs use vectors of length 1.
+    std::vector<std::string> gguf_paths;
+    std::vector<int>         gguf_fds;
+    std::vector<uint64_t>    gguf_data_bases;
 
-    // GGUF tensor map: tensor name -> (data offset relative to gguf_data_base, size in bytes).
-    // Built once at setup. Used to read raw bytes for non-resident slots.
-    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> gguf_tensors;
+    // Unified tensor map across all shards.
+    std::unordered_map<std::string, gguf_tensor_loc> gguf_tensors;
 
     // Slot plan: each entry is [layer_start, layer_end] (inclusive).
     std::vector<std::pair<int,int>> slot_ranges;
@@ -73,6 +97,25 @@ struct slotted_hot_swap_state {
     // pool_current_slot[p] = which logical slot is currently materialized in
     // pool p. Initially p (= the resident slot). Updated by swap_in.
     std::vector<int> pool_current_slot;
+
+    // Mixed-quant support (FASE 4A-3).
+    //
+    // initial_alloc_size[t] = bytes the loader allocated for pool tensor t,
+    // captured before any swap mutates dst->type / dst->nb. If a hot-swap
+    // source needs more bytes than this, we fall back to override_bufs.
+    std::unordered_map<ggml_tensor *, size_t> initial_alloc_size;
+
+    // override_bufs[t] = malloc'd buffer that has replaced t's loader-backed
+    // storage because a hot-swap source exceeded initial_alloc_size[t].
+    // Sized to the largest source size ever observed for t. Lives until
+    // slotted_hot_swap_destroy(). We use a raw vector<uint8_t> so the
+    // destructor frees automatically.
+    std::unordered_map<ggml_tensor *, std::vector<uint8_t>> override_bufs;
+
+    // For restoring dst tensor metadata at destroy time.
+    std::unordered_map<ggml_tensor *, int>     initial_type; // ggml_type
+    std::unordered_map<ggml_tensor *, std::array<size_t, GGML_MAX_DIMS>> initial_nb;
+    std::unordered_map<ggml_tensor *, void *>  initial_data;
 
     // Per-swap stats reported back to the caller.
     uint64_t total_bytes_read = 0;

@@ -11,18 +11,23 @@ Este documento cubre diseño, fases y limitaciones conocidas.
 
 ## Resumen ejecutivo
 
-- **Objetivo:** correr un modelo de 35 GB con ~11 GB de peak memory footprint.
+- **Objetivo:** correr modelos que no entran en RAM con un peak memory
+  footprint acotado, aunque cueste tiempo de wall-clock.
 - **Approach:** cargar solo `slots_resident` slots de layers; armar un
   cgraph separado por slot; pasar hidden state entre slots vía un buffer
   CPU staging; hot-swap de bytes del GGUF on-demand.
 - **Validado con Llama 3.1 70B Q3_K_XL** con `slots_resident=2`,
   `--slot-layers 10` (8 slots uniformes), generando output coherente
-  multi-token.
-- **No validado con Gemma 4 31B** — la estructura heterogénea de layers
-  (MoE intercalado con dense, n_heads variable) rompe el hot-swap
-  pool-based simple. Limitación conocida.
+  multi-token a ~11 GB peak.
+- **También validado con Llama 3.1 Tulu-3 405B Q3_K_M** (~200 GB en 5 shards)
+  con `slots_resident=2`, `--slot-layers 3` (42 slots), generando output
+  coherente a ~12.6 GB peak en una MacBook Air M4 de 24 GB (~138 s/token).
+- **No validado con Gemma 4 31B** — la estructura heterogénea de *shapes*
+  por layer (MoE intercalado con dense, n_heads variable) sigue rompiendo
+  el hot-swap pool-based. Limitación conocida.
 - **Costo de performance:** ~20× más lento que un baseline totalmente
-  residente. La técnica cambia wall-clock por peak memory.
+  residente para 70B; ~100-200× para 405B (limitado por page cache).
+  La técnica cambia wall-clock por peak memory.
 
 ## Motivación
 
@@ -164,6 +169,68 @@ La asignación de pool es round-robin: `pool_idx = K % slots_resident`.
 Cada forward pass re-swappea cada slot no residente porque los contenidos
 del pool del pase anterior están stale (y los residentes 0..R-1 también
 necesitan volver a swappearse en pases subsiguientes).
+
+### GGUFs multi-shard (FASE 4A-3)
+
+Los GGUFs mayores a ~30 GB vienen partidos en múltiples archivos
+`-NNNNN-of-NNNNN.gguf` (la convención estándar de llama.cpp). El runtime
+detecta el split via la metadata key `split.count` del shard principal y
+usa los helpers públicos `llama_split_prefix` / `llama_split_path` para
+enumerar el resto. Abre un fd `O_RDONLY` por shard y arma un mapa de
+tensores unificado:
+
+```
+name  ->  { shard_idx, off_in_shard_data, size, type }
+```
+
+En el swap, el `pread()` de la fuente apunta a `gguf_data_bases[shard_idx]
++ off_in_shard_data` sobre `gguf_fds[shard_idx]`. El resto del path de
+swap es shard-agnostic. Los GGUFs single-file siguen funcionando con un
+vector de shards de un solo elemento.
+
+### Variantes mixed-quant (FASE 4A-3)
+
+Las variantes K-quant como Q3_K_M asignan *distintos tipos de cuantización*
+a layers distintos del mismo modelo (ej. Q5_K para `ffn_down` en una
+fracción de layers, Q3_K para el resto). Los tensores del pool son
+dimensionados por el loader para los tipos de los slots residentes; cuando
+la fuente de un slot no residente tiene un tipo distinto con el mismo
+nombre:
+
+1. El runtime muta `dst->type` y recalcula `dst->nb[]` a partir del
+   `ggml_blck_size` / `ggml_type_size` de la fuente. Se asume que el
+   shape (`ne[]`) no cambia.
+2. Si `src_size > initial_alloc_size[dst]` (snapshot tomado en setup),
+   el runtime aloca un buffer override per-tensor en heap y apunta
+   `dst->data` a él. Si no, hace memcpy directo en el storage que el
+   loader alocó (que tiene espacio de sobra).
+3. El backend de compute CPU lee `dst->type` / `dst->nb[]` / `dst->data`
+   en cada build de graph, así que el cgraph del próximo slot ve el
+   kernel correcto para los bytes correctos.
+
+`set_ms` en el log de swap ya no pasa por `ggml_backend_tensor_set` en
+este path; emitimos `memcpy` directo porque el buffer override no es
+conocido por el allocator del backend buffer. Con `--n-gpu-layers 0` y
+buffers de CPU esto es equivalente al código anterior para tensores no
+mutados.
+
+Funciona para variantes donde el **shape** por layer es uniforme pero el
+**tipo** varía (Q3_K_M, Q4_K_M, Q5_K_M, etc.). **No** funciona para
+modelos con shapes heterogéneos (MoE con dense/sparse intercalados,
+n_heads variable) — esos siguen fallando porque `recompute_nb_for_type`
+mantiene `ne[]` del slot residente.
+
+Medido en Llama 3.1 Tulu-3 405B Q3_K_M (5 shards, 1138 tensores totales),
+`--slot-layers 3` → 42 slots lógicos, `--slots-resident 2`:
+
+- Slot 2 primer swap: `retyped=2 resized=0 bytes=4.68 GB`.
+- Slot 3 primer swap: `retyped=1 resized=0 bytes=4.57 GB`.
+- Slot 4..41 primer swap: `retyped=0 resized=0 bytes=4.57 GB` cada uno.
+
+`resized=0` en todos lados significa que los buffers que el loader alocó
+para los slots residentes resultaron lo bastante grandes (el slot
+residente tenía la variante de quant más alta para esos tensores). No
+hicieron falta overrides en heap durante el run.
 
 ### Decode driver
 
@@ -307,13 +374,16 @@ poc.c                                        # launcher del demo (raíz del repo
 | FASE 4A-1 | Loader filter, sin inferencia. | Peak footprint escala lineal con `slots_resident`. |
 | FASE 4A-2a | Ejecución per-slot, todos los slots cargados. | Top-1 token y logit matchean el baseline monolítico bit-for-bit, validado en 16 tokens. |
 | FASE 4A-2b | Hot-swap + 1 token con `slots_resident=2`. | Funciona en Llama 3.1 70B Q3_K_XL (35 GB → 11 GB peak); bloqueado en Gemma 4 31B por heterogeneidad de estructura de layers. |
+| FASE 4A-3 | GGUFs multi-shard + tipos de quant mixtos por layer. | Funciona en Llama 3.1 Tulu-3 405B Q3_K_M (~200 GB en 5 shards → 12.6 GB peak en M4 de 24 GB). |
 | FASE 4B | M4 kernel lab (microbenchmark). | Diseñado, no implementado todavía. |
 | FASE 5 | Eviction real con re-creación de tensors per slot. | Fuera de scope de esta ronda. |
 
-## Configuración validada
+## Configuraciones validadas
+
+### Llama 3.1 70B Q3_K_XL (FASE 4A-2b)
 
 ```
-Modelo:      Meta-Llama-3.1-70B-Instruct Q3_K_XL  (35 GB)
+Modelo:      Meta-Llama-3.1-70B-Instruct Q3_K_XL  (35 GB, single file)
 Backend:     CPU only (Apple M4 / 24 GB)
 Build:       cmake -B build -DGGML_METAL=OFF -DLLAMA_BUILD_SERVER=ON
 Flags:       --n-gpu-layers 0 --no-mmap --no-warmup --no-repack
@@ -333,14 +403,47 @@ midieron con la policy legacy round-robin. Con la default pin-and-scratch
 el mismo run completa en 19% menos wall-clock en el mismo hardware (ver
 "Política del pool de hot-swap" abajo).
 
+### Llama 3.1 Tulu-3 405B Q3_K_M (FASE 4A-3)
+
+```
+Modelo:      Llama-3.1-Tulu-3-405B-Q3_K_M  (~200 GB en 5 shards)
+Backend:     CPU only (Apple M4 / 24 GB)
+Flags:       --n-gpu-layers 0 --no-mmap --no-warmup
+             --ctx-size 128 --batch-size 8 --ubatch-size 8
+             --slot-layers 3 --slotted-real --slots-resident 2
+             --slotted-chat-poc -n 4 --verbosity 4
+Resultado:   Generación coherente.
+             Peak memory footprint: 12.6 GB.
+             5 shards detectados, 1138 tensors mapeados, 0 warnings 'not found'.
+             368 hot-swaps totales en la corrida.
+             1.68 TB de bytes streameados (el page cache del OS absorbió casi
+             todo: block_input_operations = 0).
+             4 tokens en 552 s (~138 s/token).
+             3 retypes totales (todos en los primeros swaps de slots 2 y 3,
+             que corresponden a los upgrades Q5_K per-layer del Q3_K_M).
+             0 alocaciones override en heap (los buffers del loader alcanzaban).
+```
+
+Ejemplo: `The capital of France is` → ` a city that needs`.
+
+El run de 405B usa el mismo binario `llama-cli`; las únicas diferencias
+respecto del de 70B son la ruta del modelo, `--slot-layers 3` (126 layers
+/ 3 = 42 slots), y haber sacado `--no-repack` (queda implícito off en el
+path slotted-real). No se usa `poc.c` (tiene el path del 70B
+hardcodeado); el run se lanza llamando directamente a `llama-cli`. Ver
+el snippet al final de [`README.es.poc.md`](README.es.poc.md) para el
+comando exacto.
+
 ## Limitaciones conocidas
 
-1. **Layers heterogéneos rompen el hot-swap.** Modelos donde los shapes
-   de tensor per-layer varían (Gemma 4 con dense/MoE intercalado, Mixtral,
-   variabilidad de n_heads, atención alternativa con v_proj opcional)
-   fallan con mismatches de tamaño cuando el tensor del slot lógico no
-   coincide con el del pool en el mismo offset. El runtime actual rechaza
-   el swap en lugar de corromper data silenciosamente.
+1. **Shapes heterogéneos siguen rompiendo el hot-swap.** Desde FASE 4A-3,
+   el runtime tolera variación de **tipo** por layer (Q3_K_M, Q4_K_M,
+   Q5_K_M: distintos tipos de quant para el mismo nombre de tensor en
+   distintos layers) mutando `dst->type` / `dst->nb[]` en el swap.
+   Todavía **no** tolera variación de **shape** por layer: Gemma 4 con
+   dense/MoE FFN intercalado, Mixtral, n_heads mixtos, atención alternativa
+   con v_proj opcional, etc., mantienen `ne[]` no uniforme entre layers y
+   requerirían reshape en swap time, cosa que no hacemos.
 
 2. **`--no-repack` es requerido.** El buffer type CPU_REPACK formatea los
    pesos al alocar para layouts SIMD-friendly. Replicar esa transformación
