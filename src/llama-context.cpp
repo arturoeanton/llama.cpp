@@ -4060,6 +4060,9 @@ int llama_context::decode_slotted_real_test(
     }
     n_outputs = n_outputs_all;
 
+    const bool async_pref = hs->st.async_prefetch_enabled;
+    const int  N_slots    = (int) slot_ranges.size();
+
     uint32_t pos_out = 0;
     do {
         if (!mctx_iter->apply()) {
@@ -4070,6 +4073,18 @@ int llama_context::decode_slotted_real_test(
         const auto & ubatch = mctx_iter->get_ubatch();
         std::vector<float> hidden(n_embd * ubatch.n_tokens, 0.0f);
 
+        // FASE 4C: prime the prefetch pipeline at the start of every pass.
+        // For each non-zero pool index, the upcoming first slot to land there
+        // is slot p (s = p, K=p). Enqueue them now so the worker can start
+        // loading while main does sync work on pool 0.
+        if (async_pref) {
+            for (int p = 1; p < slots_resident; ++p) {
+                if (p < N_slots) {
+                    slotted_prefetch_enqueue(hs->st, p, p);
+                }
+            }
+        }
+
         for (size_t s = 0; s < slot_ranges.size(); ++s) {
             const int il_start = slot_ranges[s].first;
             const int il_end   = slot_ranges[s].second;
@@ -4078,12 +4093,21 @@ int llama_context::decode_slotted_real_test(
             const int  pool_idx = slotted_hot_swap_pool_idx(hs->st, (int) s);
             const bool need_swap = (hs->st.pool_current_slot[pool_idx] != (int) s);
 
-            LLAMA_LOG_INFO("%s: -- slot %zu (layers %d..%d) pool=%d need_swap=%s\n",
-                    __func__, s, il_start, il_end, pool_idx, need_swap ? "yes" : "no");
+            LLAMA_LOG_INFO("%s: -- slot %zu (layers %d..%d) pool=%d need_swap=%s%s\n",
+                    __func__, s, il_start, il_end, pool_idx,
+                    need_swap ? "yes" : "no", async_pref ? " (async)" : "");
 
-            if (need_swap) {
-                // Make sure any prior cgraph compute that referenced this pool's tensors
-                // has fully finished before we overwrite their data.
+            if (async_pref) {
+                // Async path: wait for the worker to deliver this pool, or
+                // load it ourselves if there was nothing in flight. The
+                // acquire rebinds model.layers[] internally.
+                if (!slotted_pool_acquire(hs->st, (int) s, pool_idx)) {
+                    LLAMA_LOG_ERROR("%s: pool_acquire failed for slot %zu\n", __func__, s);
+                    return -4;
+                }
+            } else if (need_swap) {
+                // Sync path (legacy). Sync sched first so any in-flight
+                // compute on this pool's tensors is done.
                 LLAMA_LOG_INFO("%s: synchronizing sched before hot-swap\n", __func__);
                 ggml_backend_sched_synchronize(sched.get());
                 if (!slotted_hot_swap_swap_in(hs->st, (int) s, pool_idx)) {
@@ -4159,6 +4183,29 @@ int llama_context::decode_slotted_real_test(
                 ggml_backend_tensor_get_async(b, res->t_logits, logits.data + pos_out * n_vocab, 0, bytes);
                 pos_out += (uint32_t) n_out_ub;
             }
+
+            if (async_pref) {
+                // FASE 4C: any in-flight compute on this pool's tensors must
+                // finish before we let the worker overwrite them. For the CPU
+                // backend graph_compute is already synchronous, so this is a
+                // no-op there; kept for forward-compat with backends that may
+                // dispatch async.
+                ggml_backend_sched_synchronize(sched.get());
+                slotted_pool_release(hs->st, pool_idx);
+
+                // Enqueue the next occupant of this pool slot. Round-robin
+                // R-step look-ahead. If we run off the end of the pass, wrap
+                // to the next pass's first occupant of this pool (cross-pass
+                // priming) -- the worker silently no-ops if the model never
+                // actually visits that slot again.
+                int next_slot = (int) s + slots_resident;
+                if (next_slot >= N_slots) {
+                    next_slot -= N_slots;
+                }
+                if (next_slot >= 0 && next_slot < N_slots && next_slot != (int) s) {
+                    slotted_prefetch_enqueue(hs->st, next_slot, pool_idx);
+                }
+            }
         }
     } while (mctx_iter->next());
 
@@ -4179,6 +4226,13 @@ int llama_context::decode_slotted_real_test(
             hs->st.total_swaps,
             (unsigned long long) hs->st.total_bytes_read,
             hs->st.total_read_ms, hs->st.total_set_ms);
+
+    if (hs->st.async_prefetch_enabled) {
+        LLAMA_LOG_INFO("%s: prefetch stats: hits=%d misses=%d skipped=%d jobs_done=%d wait_ms=%.2f bg_busy_ms=%.2f\n",
+                __func__,
+                hs->st.prefetch_hits, hs->st.prefetch_misses, hs->st.prefetch_skipped,
+                hs->st.prefetch_jobs_done, hs->st.prefetch_wait_ms, hs->st.prefetch_bg_busy_ms);
+    }
 
     return 0;
 }

@@ -166,12 +166,16 @@ int slotted_hot_swap_pool_idx(const slotted_hot_swap_state & st, int slot_idx) {
     return slot_idx % st.slots_resident;
 }
 
+// Forward decl: the background worker entry point.
+static void slotted_prefetch_worker(slotted_hot_swap_state * st);
+
 bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
                             llama_model * model,
                             const std::string & gguf_path,
                             const std::vector<std::pair<int,int>> & slot_ranges,
                             int slots_resident,
-                            enum slotted_hot_swap_policy_t policy) {
+                            enum slotted_hot_swap_policy_t policy,
+                            bool async_prefetch) {
     if (model == nullptr || gguf_path.empty() || slot_ranges.empty() || slots_resident <= 0) {
         LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
         return false;
@@ -248,6 +252,8 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
     // Snapshot the initial llama_layer state for each pool slot.
     st.pool_initial_layers.resize(slots_resident);
     st.pool_current_slot.assign(slots_resident, 0);
+    st.pools.clear();
+    st.pools.reserve(slots_resident);
     for (int p = 0; p < slots_resident; ++p) {
         const int il_start = slot_ranges[p].first;
         const int il_end   = slot_ranges[p].second;
@@ -257,14 +263,39 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
         for (int il = il_start; il <= il_end; ++il) {
             dst.push_back(model->layers[il]);
         }
+
+        auto ps = std::make_unique<slotted_pool_state>();
+        ps->current_slot = p;
+        ps->in_use       = false;
+        ps->loading      = false;
+        st.pools.emplace_back(std::move(ps));
     }
 
     // Snapshot per-tensor metadata so destroy() can restore.
     snapshot_pool_tensor_metadata(st);
 
+    // FASE 4C: async prefetch only makes sense with round-robin (R >= 2),
+    // because pin-and-scratch has only one rotating pool which is exactly
+    // the one main thread is reading. Refuse to enable it otherwise.
+    st.async_prefetch_enabled = false;
+    if (async_prefetch) {
+        if (policy != SLOTTED_POOL_ROUND_ROBIN) {
+            LLAMA_LOG_WARN("%s: async_prefetch requested but policy is not round-robin; ignoring\n",
+                           __func__);
+        } else if (slots_resident < 2) {
+            LLAMA_LOG_WARN("%s: async_prefetch requested but slots_resident=%d < 2; ignoring\n",
+                           __func__, slots_resident);
+        } else {
+            st.async_prefetch_enabled = true;
+            st.shutdown.store(false);
+            st.prefetch_thread = std::thread(slotted_prefetch_worker, &st);
+        }
+    }
+
     const char * policy_name = (policy == SLOTTED_POOL_PIN_SCRATCH) ? "pin-scratch" : "round-robin";
-    LLAMA_LOG_INFO("%s: hot-swap state ready: shards=%zu tensors=%zu pools=%d policy=%s\n",
-            __func__, st.gguf_paths.size(), st.gguf_tensors.size(), slots_resident, policy_name);
+    LLAMA_LOG_INFO("%s: hot-swap state ready: shards=%zu tensors=%zu pools=%d policy=%s async_prefetch=%s\n",
+            __func__, st.gguf_paths.size(), st.gguf_tensors.size(), slots_resident, policy_name,
+            st.async_prefetch_enabled ? "on" : "off");
     for (size_t s = 0; s < st.gguf_paths.size(); ++s) {
         LLAMA_LOG_INFO("%s:   shard[%zu]: fd=%d data_off=%llu path='%s'\n",
                 __func__, s, st.gguf_fds[s],
@@ -274,23 +305,28 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
     return true;
 }
 
-bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int pool_idx) {
+// Pure I/O for one slot into one pool. Mutates pool tensors' data/type/nb to
+// reflect the source's quant (FASE 4A-3 mixed-quant logic). Does NOT rebind
+// model.layers[] and does NOT update pool_current_slot[]; the caller does
+// that after taking whatever locks are needed.
+//
+// `tag` is just for log lines so the worker thread can identify itself.
+// `from_worker` selects whether the per-load stats line is logged as the
+// foreground swap or the bg worker swap.
+static bool do_load_into_pool(slotted_hot_swap_state & st,
+                              int slot_idx, int pool_idx,
+                              const char * tag) {
     if (st.model == nullptr || st.gguf_fds.empty()) {
-        LLAMA_LOG_ERROR("%s: state not initialized\n", __func__);
+        LLAMA_LOG_ERROR("%s: state not initialized\n", tag);
         return false;
     }
     if (slot_idx < 0 || slot_idx >= (int) st.slot_ranges.size()) {
-        LLAMA_LOG_ERROR("%s: slot_idx %d out of range\n", __func__, slot_idx);
+        LLAMA_LOG_ERROR("%s: slot_idx %d out of range\n", tag, slot_idx);
         return false;
     }
     if (pool_idx < 0 || pool_idx >= st.slots_resident) {
-        LLAMA_LOG_ERROR("%s: pool_idx %d out of range [0,%d)\n", __func__, pool_idx, st.slots_resident);
+        LLAMA_LOG_ERROR("%s: pool_idx %d out of range [0,%d)\n", tag, pool_idx, st.slots_resident);
         return false;
-    }
-    if (st.pool_current_slot[pool_idx] == slot_idx) {
-        // Already resident in this pool. No-op.
-        LLAMA_LOG_INFO("%s: slot=%d already in pool=%d (no-op)\n", __func__, slot_idx, pool_idx);
-        return true;
     }
 
     const int log_start = st.slot_ranges[slot_idx].first;
@@ -301,14 +337,12 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
     const int phy_size  = phy_end - phy_start + 1;
     if (log_size != phy_size) {
         LLAMA_LOG_ERROR("%s: slot %d has %d layers but pool %d has %d (size mismatch)\n",
-                __func__, slot_idx, log_size, pool_idx, phy_size);
+                tag, slot_idx, log_size, pool_idx, phy_size);
         return false;
     }
 
-    LLAMA_LOG_INFO("%s: swapping logical slot %d (layers %d..%d) into pool %d (phys %d..%d)\n",
-            __func__, slot_idx, log_start, log_end, pool_idx, phy_start, phy_end);
-
-    const auto & pool_initial = st.pool_initial_layers[pool_idx];
+    LLAMA_LOG_INFO("%s: loading logical slot %d (layers %d..%d) into pool %d (phys %d..%d)\n",
+            tag, slot_idx, log_start, log_end, pool_idx, phy_start, phy_end);
 
     uint64_t bytes_this_swap = 0;
     int      tensors_touched = 0;
@@ -332,22 +366,17 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
         const int offset_in_pool = phy_il - phy_start;
         const int log_il = log_start + offset_in_pool;
 
-        // Build the logical tensor name: replace "blk.<phy_il>." with "blk.<log_il>."
         char log_name[GGML_MAX_NAME];
         std::snprintf(log_name, sizeof(log_name), "blk.%d.%s", log_il, suffix.c_str());
 
         auto it = st.gguf_tensors.find(log_name);
         if (it == st.gguf_tensors.end()) {
-            // Genuinely absent from the GGUF (across all shards). For optional
-            // tensors (rope_freqs etc.) this is fine; if the graph needs it,
-            // we'll crash later anyway.
-            LLAMA_LOG_WARN("%s: source tensor '%s' not found in GGUF (skipping)\n",
-                           __func__, log_name);
+            LLAMA_LOG_WARN("%s: source tensor '%s' not found in GGUF (skipping)\n", tag, log_name);
             continue;
         }
         const gguf_tensor_loc & loc = it->second;
         if (loc.shard_idx < 0 || loc.shard_idx >= (int) st.gguf_fds.size()) {
-            LLAMA_LOG_ERROR("%s: bogus shard_idx=%d for '%s'\n", __func__, loc.shard_idx, log_name);
+            LLAMA_LOG_ERROR("%s: bogus shard_idx=%d for '%s'\n", tag, loc.shard_idx, log_name);
             return false;
         }
         const int      fd       = st.gguf_fds[loc.shard_idx];
@@ -355,23 +384,19 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
         const uint64_t src_size = loc.size;
         const enum ggml_type src_type = (enum ggml_type) loc.type;
 
-        // Resolve dst's loader-allocated buffer size (snapshotted at setup).
         size_t init_alloc = 0;
         {
             auto it2 = st.initial_alloc_size.find(dst_tensor);
             init_alloc = (it2 != st.initial_alloc_size.end()) ? it2->second : ggml_nbytes(dst_tensor);
         }
 
-        // Decide whether we need to mutate dst's type/nb (mixed-quant).
         const bool need_retype = (src_type != (enum ggml_type) dst_tensor->type) ||
                                  (src_size != (uint64_t) ggml_nbytes(dst_tensor));
 
-        // Decide whether we need an override buffer (src doesn't fit dst's
-        // loader allocation, or already on override and dst->data still points
-        // at a now-too-small override).
         uint8_t * write_ptr = (uint8_t *) dst_tensor->data;
         if (src_size > (uint64_t) init_alloc) {
-            // Use / grow the override buffer for this tensor.
+            // Map mutation must be serialized across main and worker threads.
+            std::lock_guard<std::mutex> lk(st.runtime_mu);
             auto & buf = st.override_bufs[dst_tensor];
             if (buf.size() < src_size) {
                 buf.resize((size_t) src_size);
@@ -379,20 +404,19 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
             dst_tensor->data = buf.data();
             write_ptr        = buf.data();
             ++tensors_resized;
-        } else if (st.override_bufs.count(dst_tensor) != 0) {
-            // We already overrode this tensor previously and the override is
-            // big enough -- keep using it.
-            write_ptr = (uint8_t *) dst_tensor->data;
+        } else {
+            std::lock_guard<std::mutex> lk(st.runtime_mu);
+            if (st.override_bufs.count(dst_tensor) != 0) {
+                write_ptr = (uint8_t *) dst_tensor->data;
+            }
         }
 
         if (need_retype) {
-            // Same shape (ne[]) assumed; only type changes. Mutate type and nb.
             dst_tensor->type = src_type;
             recompute_nb_for_type(dst_tensor);
             ++tensors_retyped;
         }
 
-        // Read bytes from the right shard's fd and copy into dst's storage.
         uint64_t   bytes_done = 0;
         const auto t_read_start = std::chrono::steady_clock::now();
         while (bytes_done < src_size) {
@@ -401,16 +425,11 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
                                        (off_t)(src_off + bytes_done));
             if (n <= 0) {
                 LLAMA_LOG_ERROR("%s: pread failed for '%s' (shard=%d) at off=%llu (%zd)\n",
-                        __func__, log_name, loc.shard_idx,
+                        tag, log_name, loc.shard_idx,
                         (unsigned long long)(src_off + bytes_done), n);
                 return false;
             }
             const auto t_set_start = std::chrono::steady_clock::now();
-            // Direct memcpy when dst->data is a host pointer (override buffer
-            // or CPU backend buffer). ggml_backend_tensor_set is safer when
-            // the buffer lives on a non-CPU backend, but here we are CPU-only
-            // and we may have replaced data with a malloc'd buffer that the
-            // backend doesn't know about.
             std::memcpy(write_ptr + bytes_done, scratch.data(), (size_t) n);
             set_ms_this += ms_since(t_set_start);
             bytes_done += (uint64_t) n;
@@ -421,25 +440,187 @@ bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int poo
         ++tensors_touched;
     }
 
-    // Rebind: model.layers[log_start..log_end] = pool_initial[pool_idx][0..]
-    // After this, the graph builder dereferences model.layers[log_il].wq and gets the
-    // tensor pointer that physically holds slot_idx's bytes.
-    for (int i = 0; i < log_size; ++i) {
-        st.model->layers[log_start + i] = pool_initial[i];
+    // Stats: in async mode the same counters track both fg and bg work, so
+    // guard the accumulation against concurrent updates from the worker.
+    {
+        std::lock_guard<std::mutex> lk(st.runtime_mu);
+        st.total_bytes_read += bytes_this_swap;
+        st.total_read_ms    += read_ms_this;
+        st.total_set_ms     += set_ms_this;
+        st.total_swaps      += 1;
     }
 
-    st.pool_current_slot[pool_idx] = slot_idx;
-
-    st.total_bytes_read += bytes_this_swap;
-    st.total_read_ms    += read_ms_this;
-    st.total_set_ms     += set_ms_this;
-    st.total_swaps      += 1;
-
     LLAMA_LOG_INFO("%s: slot=%d pool=%d tensors=%d retyped=%d resized=%d bytes=%llu read_ms=%.2f set_ms=%.2f\n",
-            __func__, slot_idx, pool_idx, tensors_touched, tensors_retyped, tensors_resized,
+            tag, slot_idx, pool_idx, tensors_touched, tensors_retyped, tensors_resized,
             (unsigned long long) bytes_this_swap, read_ms_this, set_ms_this);
 
     return true;
+}
+
+// Rebind model.layers[log_start..log_end] to the pool's snapshotted layers.
+// Always done on the main thread, with the pool lock NOT held (rebind only
+// touches model.layers[], not pool tensors).
+static void do_rebind_layers(slotted_hot_swap_state & st, int slot_idx, int pool_idx) {
+    const int log_start = st.slot_ranges[slot_idx].first;
+    const int log_end   = st.slot_ranges[slot_idx].second;
+    const auto & pool_initial = st.pool_initial_layers[pool_idx];
+    const int log_size = log_end - log_start + 1;
+    for (int i = 0; i < log_size; ++i) {
+        st.model->layers[log_start + i] = pool_initial[i];
+    }
+}
+
+bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int pool_idx) {
+    if (slot_idx < 0 || slot_idx >= (int) st.slot_ranges.size() ||
+        pool_idx < 0 || pool_idx >= st.slots_resident) {
+        LLAMA_LOG_ERROR("%s: bad indices slot=%d pool=%d\n", __func__, slot_idx, pool_idx);
+        return false;
+    }
+    if (st.pool_current_slot[pool_idx] == slot_idx) {
+        LLAMA_LOG_INFO("%s: slot=%d already in pool=%d (no-op)\n", __func__, slot_idx, pool_idx);
+        return true;
+    }
+    if (!do_load_into_pool(st, slot_idx, pool_idx, __func__)) return false;
+    do_rebind_layers(st, slot_idx, pool_idx);
+    st.pool_current_slot[pool_idx] = slot_idx;
+    if (pool_idx < (int) st.pools.size() && st.pools[pool_idx]) {
+        st.pools[pool_idx]->current_slot = slot_idx;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// FASE 4C async-prefetch API.
+// ---------------------------------------------------------------------------
+
+void slotted_prefetch_enqueue(slotted_hot_swap_state & st, int slot_idx, int pool_idx) {
+    if (!st.async_prefetch_enabled) return;
+    if (slot_idx < 0 || slot_idx >= (int) st.slot_ranges.size()) return;
+    if (pool_idx < 0 || pool_idx >= st.slots_resident)            return;
+
+    // Cheap pre-check: don't bother queuing if the pool already holds the
+    // wanted slot AND no one is loading it. Worker would skip anyway, but
+    // this saves a queue cycle.
+    {
+        slotted_pool_state * ps = st.pools[pool_idx].get();
+        std::lock_guard<std::mutex> lk(ps->mu);
+        if (ps->current_slot == slot_idx && !ps->loading) {
+            return;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(st.queue_mu);
+        st.prefetch_queue.emplace(slot_idx, pool_idx);
+    }
+    st.queue_cv.notify_one();
+}
+
+bool slotted_pool_acquire(slotted_hot_swap_state & st, int slot_idx, int pool_idx) {
+    if (slot_idx < 0 || slot_idx >= (int) st.slot_ranges.size() ||
+        pool_idx < 0 || pool_idx >= st.slots_resident) {
+        LLAMA_LOG_ERROR("%s: bad indices slot=%d pool=%d\n", __func__, slot_idx, pool_idx);
+        return false;
+    }
+
+    slotted_pool_state * ps = st.pools[pool_idx].get();
+    bool need_sync_load = false;
+    bool was_hit        = false;
+    const auto t_wait_start = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lk(ps->mu);
+        // Wait for any bg load to finish (and for the in_use flag to clear,
+        // though main shouldn't double-acquire).
+        ps->cv.wait(lk, [&]{ return !ps->loading && !ps->in_use; });
+        if (ps->current_slot == slot_idx) {
+            was_hit = true;
+        } else {
+            need_sync_load = true;
+        }
+        ps->in_use = true;
+    }
+    st.prefetch_wait_ms += ms_since(t_wait_start);
+
+    if (need_sync_load) {
+        ++st.prefetch_misses;
+        if (!do_load_into_pool(st, slot_idx, pool_idx, "slotted_pool_acquire(miss)")) {
+            // Surface error and release the pool so the worker can recover.
+            std::lock_guard<std::mutex> lk(ps->mu);
+            ps->in_use = false;
+            ps->cv.notify_all();
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(ps->mu);
+        ps->current_slot = slot_idx;
+        st.pool_current_slot[pool_idx] = slot_idx;
+    } else {
+        if (was_hit && st.async_prefetch_enabled) {
+            ++st.prefetch_hits;
+        }
+    }
+
+    do_rebind_layers(st, slot_idx, pool_idx);
+    return true;
+}
+
+void slotted_pool_release(slotted_hot_swap_state & st, int pool_idx) {
+    if (pool_idx < 0 || pool_idx >= st.slots_resident) return;
+    slotted_pool_state * ps = st.pools[pool_idx].get();
+    {
+        std::lock_guard<std::mutex> lk(ps->mu);
+        ps->in_use = false;
+    }
+    ps->cv.notify_all();
+}
+
+// Background worker. Pulls (slot, pool) jobs from the queue; for each, waits
+// until the pool is idle, then runs a load. Skips a job if the pool already
+// has the wanted slot when it is picked up.
+static void slotted_prefetch_worker(slotted_hot_swap_state * st) {
+    while (true) {
+        std::pair<int,int> job;
+        {
+            std::unique_lock<std::mutex> lk(st->queue_mu);
+            st->queue_cv.wait(lk, [st]{ return st->shutdown.load() || !st->prefetch_queue.empty(); });
+            if (st->shutdown.load() && st->prefetch_queue.empty()) return;
+            job = st->prefetch_queue.front();
+            st->prefetch_queue.pop();
+        }
+        const int slot_idx = job.first;
+        const int pool_idx = job.second;
+        if (pool_idx < 0 || pool_idx >= (int) st->pools.size()) continue;
+
+        slotted_pool_state * ps = st->pools[pool_idx].get();
+        bool do_load = false;
+        {
+            std::unique_lock<std::mutex> lk(ps->mu);
+            // Wait until main releases the pool.
+            ps->cv.wait(lk, [&]{ return st->shutdown.load() || !ps->in_use; });
+            if (st->shutdown.load()) return;
+            if (ps->current_slot == slot_idx) {
+                ++st->prefetch_skipped;
+            } else {
+                ps->loading = true;
+                do_load = true;
+            }
+        }
+        if (!do_load) continue;
+
+        const auto t_start = std::chrono::steady_clock::now();
+        const bool ok = do_load_into_pool(*st, slot_idx, pool_idx, "prefetch_worker");
+        const double dt = ms_since(t_start);
+
+        {
+            std::lock_guard<std::mutex> lk(ps->mu);
+            if (ok) {
+                ps->current_slot = slot_idx;
+                st->pool_current_slot[pool_idx] = slot_idx;
+            }
+            ps->loading = false;
+            st->prefetch_bg_busy_ms += dt;
+            ++st->prefetch_jobs_done;
+        }
+        ps->cv.notify_all();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +635,8 @@ struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
                     int32_t  slot_layers,
                     int32_t  slot_size_mb,
                     int32_t  slots_resident,
-                    int32_t  policy) {
+                    int32_t  policy,
+                    int32_t  async_prefetch) {
     if (model == nullptr || gguf_path == nullptr) {
         LLAMA_LOG_ERROR("%s: null args\n", __func__);
         return nullptr;
@@ -523,11 +705,34 @@ struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
         (policy == 1) ? SLOTTED_POOL_PIN_SCRATCH : SLOTTED_POOL_ROUND_ROBIN;
 
     auto * hs = new llama_slotted_hot_swap;
-    if (!slotted_hot_swap_setup(hs->st, model, gguf_path, ranges, slots_resident, pol)) {
+    if (!slotted_hot_swap_setup(hs->st, model, gguf_path, ranges, slots_resident, pol, async_prefetch != 0)) {
         delete hs;
         return nullptr;
     }
     return hs;
+}
+
+int32_t llama_slotted_hot_swap_pool_acquire(
+        struct llama_slotted_hot_swap * hs,
+                              int32_t   slot_idx,
+                              int32_t   pool_idx) {
+    if (hs == nullptr) return -1;
+    return slotted_pool_acquire(hs->st, slot_idx, pool_idx) ? 0 : -1;
+}
+
+void llama_slotted_hot_swap_pool_release(
+        struct llama_slotted_hot_swap * hs,
+                              int32_t   pool_idx) {
+    if (hs == nullptr) return;
+    slotted_pool_release(hs->st, pool_idx);
+}
+
+void llama_slotted_hot_swap_prefetch_enqueue(
+        struct llama_slotted_hot_swap * hs,
+                              int32_t   slot_idx,
+                              int32_t   pool_idx) {
+    if (hs == nullptr) return;
+    slotted_prefetch_enqueue(hs->st, slot_idx, pool_idx);
 }
 
 int32_t llama_slotted_hot_swap_swap_in(
@@ -547,6 +752,27 @@ void llama_slotted_hot_swap_free(struct llama_slotted_hot_swap * hs) {
 } // extern "C"
 
 void slotted_hot_swap_destroy(slotted_hot_swap_state & st) {
+    // Stop the prefetch worker first so it doesn't race with the fd close
+    // or the metadata restoration below.
+    if (st.async_prefetch_enabled) {
+        st.shutdown.store(true);
+        st.queue_cv.notify_all();
+        // Notify all pool CVs in case the worker is waiting on an in_use pool.
+        for (auto & ps : st.pools) {
+            if (!ps) continue;
+            std::lock_guard<std::mutex> lk(ps->mu);
+            ps->cv.notify_all();
+        }
+        if (st.prefetch_thread.joinable()) {
+            st.prefetch_thread.join();
+        }
+        st.async_prefetch_enabled = false;
+
+        LLAMA_LOG_INFO("slotted_hot_swap_destroy: prefetch summary jobs=%d hits=%d misses=%d skipped=%d wait_ms=%.2f bg_busy_ms=%.2f\n",
+                       st.prefetch_jobs_done, st.prefetch_hits, st.prefetch_misses,
+                       st.prefetch_skipped, st.prefetch_wait_ms, st.prefetch_bg_busy_ms);
+    }
+
     // Close all shard fds.
     for (size_t s = 0; s < st.gguf_fds.size(); ++s) {
         if (st.gguf_fds[s] >= 0) {
@@ -597,5 +823,7 @@ void slotted_hot_swap_destroy(slotted_hot_swap_state & st) {
     st.initial_nb.clear();
     st.initial_data.clear();
     st.override_bufs.clear();
+    st.pools.clear();
+    while (!st.prefetch_queue.empty()) st.prefetch_queue.pop();
     st.model = nullptr;
 }

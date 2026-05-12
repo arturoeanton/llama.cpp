@@ -658,19 +658,42 @@ extern "C" {
     // Constraints: text-only Gemma 4, --no-repack, batch_size 1.
     struct llama_slotted_hot_swap;
 
-    // policy: 0 = round-robin (pool_idx = slot_idx % R)
-    //         1 = pin-and-scratch (pins slots 0..R-2; pool R-1 is the scratch)
+    // policy:         0 = round-robin (pool_idx = slot_idx % R)
+    //                 1 = pin-and-scratch (pins slots 0..R-2; pool R-1 is the scratch)
+    // async_prefetch: 0 = synchronous, 1 = enable FASE 4C background worker.
+    //                 Only honored when policy=round-robin and slots_resident >= 2;
+    //                 otherwise ignored with a warning.
     LLAMA_API struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
             struct llama_model * model,
                     const char * gguf_path,
                         int32_t  slot_layers,
                         int32_t  slot_size_mb,
                         int32_t  slots_resident,
-                        int32_t  policy);
+                        int32_t  policy,
+                        int32_t  async_prefetch);
 
     // Make logical slot `slot_idx` resident in pool `pool_idx`. Returns 0 on
     // success, negative on error. No-op if the slot is already in that pool.
+    // Legacy synchronous API; does not interact with the async-prefetch
+    // protocol.
     LLAMA_API int32_t llama_slotted_hot_swap_swap_in(
+            struct llama_slotted_hot_swap * hs,
+                                  int32_t   slot_idx,
+                                  int32_t   pool_idx);
+
+    // FASE 4C async-prefetch API. See src/llama-slotted-runtime.h for the
+    // protocol summary. In short:
+    //   acquire        block until pool holds slot, mark in-use, rebind layers
+    //   release        clear in-use, notify worker
+    //   enqueue        ask worker to pre-load (slot, pool) eventually
+    LLAMA_API int32_t llama_slotted_hot_swap_pool_acquire(
+            struct llama_slotted_hot_swap * hs,
+                                  int32_t   slot_idx,
+                                  int32_t   pool_idx);
+    LLAMA_API void    llama_slotted_hot_swap_pool_release(
+            struct llama_slotted_hot_swap * hs,
+                                  int32_t   pool_idx);
+    LLAMA_API void    llama_slotted_hot_swap_prefetch_enqueue(
             struct llama_slotted_hot_swap * hs,
                                   int32_t   slot_idx,
                                   int32_t   pool_idx);

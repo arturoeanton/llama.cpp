@@ -537,7 +537,8 @@ int main(int argc, char ** argv) {
                 params.slot_layers,
                 params.slot_size_mb,
                 params.slots_resident,
-                params.slotted_round_robin ? 0 : 1);
+                params.slotted_round_robin ? 0 : 1,
+                params.slotted_async_prefetch ? 1 : 0);
         if (hs == nullptr) {
             console::error("slotted-chat-poc: hot-swap init failed\n");
             return 1;
@@ -656,7 +657,8 @@ int main(int argc, char ** argv) {
                                              params.slot_layers,
                                              params.slot_size_mb,
                                              params.slots_resident,
-                                             params.slotted_round_robin ? 0 : 1);
+                                             params.slotted_round_robin ? 0 : 1,
+                                             params.slotted_async_prefetch ? 1 : 0);
             if (hs == nullptr) {
                 console::error("slotted-decode-test: hot-swap init failed\n");
                 return 1;

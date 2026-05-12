@@ -499,6 +499,7 @@ struct common_params {
     bool        slotted_decode_baseline    = false;  // FASE 4A-2a: run normal llama_decode on the same prompt for comparison
     bool        slotted_chat_poc           = false;  // FASE 4A-2b: interactive chat loop using the slotted-real runtime (demo)
     bool        slotted_round_robin        = false;  // FASE 4A-2b: opt out of the default pin-and-scratch hot-swap policy and use the legacy round-robin one
+    bool        slotted_async_prefetch     = false;  // FASE 4C: enable background prefetch thread (requires round-robin + slots_resident >= 2)
 
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)

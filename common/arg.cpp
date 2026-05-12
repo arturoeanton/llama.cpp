@@ -2360,6 +2360,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--slotted-async-prefetch"},
+        "experimental: FASE 4C - enable background prefetch thread that loads slot K+1 "
+        "into the alternate pool while slot K is being computed. Requires round-robin "
+        "policy (pin-and-scratch only has one rotating pool). Off by default; the run "
+        "falls back to synchronous behaviour if conditions aren't met.",
+        [](common_params & params) {
+            params.slotted_async_prefetch = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

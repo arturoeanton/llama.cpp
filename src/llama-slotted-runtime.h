@@ -33,8 +33,14 @@
 #include "ggml.h"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -69,6 +75,20 @@ struct gguf_tensor_loc {
     int       type             = 0; // really enum ggml_type
 };
 
+// Per-pool synchronization state used by the async-prefetch path (FASE 4C).
+// `current_slot` is what is presently materialised in this pool. It is updated
+// either by the main thread (sync swap) or by the background prefetch thread.
+// `in_use` and `loading` are mutually exclusive: in_use means the main thread
+// is currently computing on this pool's tensors; loading means the background
+// thread is writing into them. Both transitions are protected by `mu`.
+struct slotted_pool_state {
+    std::mutex              mu;
+    std::condition_variable cv;
+    int                     current_slot = -1;
+    bool                    in_use       = false;
+    bool                    loading      = false;
+};
+
 struct slotted_hot_swap_state {
     // The model whose layer pointers will be mutated.
     llama_model * model = nullptr;
@@ -95,8 +115,15 @@ struct slotted_hot_swap_state {
     std::vector<std::vector<llama_layer>> pool_initial_layers;
 
     // pool_current_slot[p] = which logical slot is currently materialized in
-    // pool p. Initially p (= the resident slot). Updated by swap_in.
+    // pool p. Initially p (= the resident slot). Updated by swap_in / the
+    // async prefetch worker. Kept in sync with pools[p]->current_slot.
     std::vector<int> pool_current_slot;
+
+    // Per-pool sync state for the async-prefetch path (FASE 4C). Always
+    // allocated (one entry per pool) regardless of whether async_prefetch is
+    // on, so the sync paths can also share the structure. unique_ptr is used
+    // because std::mutex is neither copyable nor movable.
+    std::vector<std::unique_ptr<slotted_pool_state>> pools;
 
     // Mixed-quant support (FASE 4A-3).
     //
@@ -122,15 +149,45 @@ struct slotted_hot_swap_state {
     double   total_read_ms    = 0.0;
     double   total_set_ms     = 0.0;
     int      total_swaps      = 0;
+
+    // Async-prefetch state (FASE 4C). When `async_prefetch_enabled` is true
+    // and the policy is round-robin (R >= 2), a single background worker
+    // thread consumes jobs from `prefetch_queue` and pre-loads slots into
+    // alternate pool buffers while the main thread computes on the active
+    // pool. Round-robin guarantees the alternate pool is idle while pool
+    // `K % R` is in use, so no extra memory is required.
+    bool                                  async_prefetch_enabled = false;
+    std::thread                           prefetch_thread;
+    std::mutex                            queue_mu;
+    std::condition_variable               queue_cv;
+    std::queue<std::pair<int,int>>        prefetch_queue;        // (slot_idx, pool_idx)
+    std::atomic<bool>                     shutdown{false};
+
+    // Async-prefetch metrics.
+    int    prefetch_hits        = 0;     // acquires that found the pool already loaded
+    int    prefetch_misses      = 0;     // acquires that had to load synchronously
+    int    prefetch_skipped     = 0;     // enqueued jobs the worker skipped (already loaded)
+    double prefetch_wait_ms     = 0.0;   // total time main blocked waiting for the worker
+    double prefetch_bg_busy_ms  = 0.0;   // total time the worker spent doing I/O
+    int    prefetch_jobs_done   = 0;
+
+    // Serializes access to override_bufs (unordered_map operations from main
+    // and the worker can otherwise race even on disjoint keys) and to the
+    // total_* stats counters. Held only briefly.
+    std::mutex runtime_mu;
 };
 
 // Open GGUF, build the offset map, snapshot pool layers. Returns false on error.
+// `async_prefetch` enables the FASE 4C background worker; only meaningful when
+// the policy is round-robin (the pin-and-scratch policy doesn't have a free
+// alternate pool to prefetch into without extra memory).
 bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
                             llama_model * model,
                             const std::string & gguf_path,
                             const std::vector<std::pair<int,int>> & slot_ranges,
                             int slots_resident,
-                            enum slotted_hot_swap_policy_t policy);
+                            enum slotted_hot_swap_policy_t policy,
+                            bool async_prefetch);
 
 // Map slot_idx -> pool_idx according to the current policy. The decode driver
 // uses this to decide where each logical slot lives.
@@ -142,9 +199,35 @@ int slotted_hot_swap_pool_idx(const slotted_hot_swap_state & st, int slot_idx);
 // the pool's tensor buffers, and rebinds `model.layers[slot.range] =
 // pool_initial_layers[pool_idx]`.
 // Returns false on error (with a logged reason).
+//
+// This is the legacy synchronous API. It does NOT participate in the FASE 4C
+// async-prefetch protocol; callers that want to overlap I/O with compute must
+// use the pool_acquire / pool_release / prefetch_enqueue triple below.
 bool slotted_hot_swap_swap_in(slotted_hot_swap_state & st, int slot_idx, int pool_idx);
 
+// FASE 4C async-prefetch API.
+//
+// `slotted_pool_acquire`: block until pool `pool_idx` is fully loaded with
+//   logical slot `slot_idx`, then mark it in_use and rebind model.layers[].
+//   If the slot is already there (HIT, possibly because the worker pre-loaded
+//   it), returns immediately after the rebind. Otherwise loads synchronously
+//   on the main thread.
+//
+// `slotted_pool_release`: release pool `pool_idx`. After this returns the
+//   background worker is free to start loading the next job for this pool.
+//   Must be called after the caller has synchronized any in-flight compute
+//   that referenced this pool's tensors.
+//
+// `slotted_prefetch_enqueue`: schedule the background worker to load
+//   `slot_idx` into pool `pool_idx`. Idempotent: if the pool is already
+//   loaded with the right slot, the worker skips the job. Cheap to call.
+//   Safe to call even when async_prefetch is off (it becomes a no-op).
+bool slotted_pool_acquire   (slotted_hot_swap_state & st, int slot_idx, int pool_idx);
+void slotted_pool_release   (slotted_hot_swap_state & st, int pool_idx);
+void slotted_prefetch_enqueue(slotted_hot_swap_state & st, int slot_idx, int pool_idx);
+
 // Restore the pool slots' layer bindings to their initial state, close fd.
+// Joins the background worker thread if async_prefetch was enabled.
 void slotted_hot_swap_destroy(slotted_hot_swap_state & st);
 
 // Public wrapper type referenced by the C API (definition kept in the same
