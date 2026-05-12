@@ -28,6 +28,22 @@
 #include <utility>
 #include <vector>
 
+// Hot-swap pool replacement policy.
+//
+// ROUND_ROBIN: pool_idx = slot_idx % R. Every pass after the first re-swaps
+//   every slot because the pool ends each pass holding the last R slots.
+//   Steady state = N swaps/pass.
+//
+// PIN_SCRATCH: pins slots 0..R-2 in pools 0..R-2 permanently; pool R-1 is the
+//   single scratch that rotates through slots R-1..N-1. Slot 0..R-2 always
+//   hit. Steady state = N - (R - 1) = N - R + 1 swaps/pass.
+//   For R=2, N=8 this saves 1 swap per steady-state pass.
+//   Requires R >= 2 (with R == 1, there is nothing to pin).
+enum slotted_hot_swap_policy_t {
+    SLOTTED_POOL_ROUND_ROBIN = 0,
+    SLOTTED_POOL_PIN_SCRATCH = 1,
+};
+
 struct slotted_hot_swap_state {
     // The model whose layer pointers will be mutated.
     llama_model * model = nullptr;
@@ -45,6 +61,7 @@ struct slotted_hot_swap_state {
     // Slot plan: each entry is [layer_start, layer_end] (inclusive).
     std::vector<std::pair<int,int>> slot_ranges;
     int slots_resident = 0;
+    enum slotted_hot_swap_policy_t policy = SLOTTED_POOL_ROUND_ROBIN;
 
     // For each pool slot (0..slots_resident-1), snapshot of `model.layers[il]`
     // for il in the pool's physical layer range. We restore from here when
@@ -69,7 +86,12 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
                             llama_model * model,
                             const std::string & gguf_path,
                             const std::vector<std::pair<int,int>> & slot_ranges,
-                            int slots_resident);
+                            int slots_resident,
+                            enum slotted_hot_swap_policy_t policy);
+
+// Map slot_idx -> pool_idx according to the current policy. The decode driver
+// uses this to decide where each logical slot lives.
+int slotted_hot_swap_pool_idx(const slotted_hot_swap_state & st, int slot_idx);
 
 // Make logical slot `slot_idx` resident in pool slot `pool_idx`.
 // If pool_idx already holds slot_idx, this is a no-op (returns true quickly).

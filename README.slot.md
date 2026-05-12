@@ -232,6 +232,44 @@ These flags live in `common/arg.cpp` and are CLI-only (`LLAMA_EXAMPLE_CLI`).
 | `--slotted-decode-test` | Run `llama_decode_slotted_test` (or `_real_test` if combined with `--slotted-real`) on the `-p` prompt, sample `-n` tokens greedily, print. |
 | `--slotted-decode-baseline` | Run normal `llama_decode` on the same prompt and sampling for comparison. |
 | `--slotted-chat-poc` | Interactive chat loop using the slotted-real runtime. Used by `poc.c`. |
+| `--slotted-round-robin` | Opt out of the default pin-and-scratch hot-swap policy and use the legacy round-robin one (pool_idx = slot_idx % R). See "Hot-swap pool policy" below. |
+
+## Hot-swap pool policy
+
+The runtime supports two replacement policies for the slot buffer pool:
+
+- **`pin-and-scratch` (default, when `slots_resident >= 2`)**: pins slots
+  `0..R-2` in pools `0..R-2` for the lifetime of the run; pool `R-1` is the
+  single scratch slot that rotates through `slots R-1..N-1`. Slots `0..R-2`
+  always hit. Steady-state swap count per forward pass: `N - R + 1`.
+- **`round-robin` (legacy, opt-in via `--slotted-round-robin`)**: assigns
+  `pool_idx = slot_idx % R`. Every steady-state pass re-swaps all `N` slots
+  because the pool ends each pass holding the last `R` accessed slots.
+  Steady-state swap count per forward pass: `N`.
+
+For our reference workload (Llama 3.1 70B Q3_K_XL, `N=8`, `R=2`, prompt
+"The capital of France is", `-n 8`):
+
+| Metric                | round-robin | pin-and-scratch | delta |
+|---|---:|---:|---:|
+| Total swaps           | 102 | 90 | -12 (-11.8%) |
+| Bytes read            | 425 GB | 375 GB | -50 GB (-11.8%) |
+| Sum read_ms           | 264.2 s | 195.0 s | -26.2% |
+| Sum set_ms            | 157.1 s | 68.7 s | -56.3% |
+| **Real time**         | **311.2 s** | **251.9 s** | **-59.3 s (-19.0%)** |
+| Peak memory footprint | 11,357 MB | 11,362 MB | identical |
+| OS swaps              | 0 | 0 | identical |
+| Generated text        | `a city of love, art, fashion` | `a city of love, art, fashion` | identical |
+
+> pin-and-scratch is the default policy because it reduced runtime by 19%
+> on MacBook Air M4 24GB with Llama 3.1 70B Q3_K_XL, with identical output
+> and no additional peak memory footprint.
+
+The unexpectedly large drop in `set_ms` (56% vs the swap-count drop of
+12%) is because round-robin writes to **both** pool buffers in alternation,
+keeping both sets of pool pages hot in the CPU cache. Pin-and-scratch only
+ever writes to pool `R-1` after init, so the pinned pool's pages can stay
+cold and there is less cache competition on the write side.
 
 ## Files
 
@@ -285,6 +323,11 @@ Result:      Coherent generation. Peak memory footprint ~11 GB across runs.
 Examples of `Hello, my name is` → ` John and I am a 30-year-old` and
 `The capital of France is` → ` a city of love, art, fashion`.
 
+The numbers in the "Phase log" / FASE 4A-2b row above were measured with
+the legacy round-robin policy. With the default pin-and-scratch policy
+the same run completes in 19% less wall-clock time on the same hardware
+(see "Hot-swap pool policy" below).
+
 ## Known limitations
 
 1. **Heterogeneous layers break hot-swap.** Models where per-layer tensor
@@ -323,10 +366,11 @@ Examples of `Hello, my name is` → ` John and I am a 30-year-old` and
    filter. This is intentional: KV state must persist across slot rotations
    within a forward pass.
 
-7. **Round-robin pool assignment is suboptimal.** Every forward pass after
-   the first re-swaps every slot. A simple LRU or "keep the resident slots
-   resident" policy could reduce swaps significantly. The current code
-   prioritises simplicity over performance.
+7. **Pool replacement policy.** The default is `pin-and-scratch` (pin R-1
+   slots, use 1 scratch); legacy round-robin remains available via
+   `--slotted-round-robin`. See "Hot-swap pool policy" for the measured
+   trade-off. Both are still suboptimal vs Belady (optimal for the cyclic
+   access pattern), but Belady-style lookahead is not implemented here.
 
 ## Disclosure
 

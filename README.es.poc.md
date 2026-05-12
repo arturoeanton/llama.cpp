@@ -114,6 +114,13 @@ Enter en línea vacía o Ctrl-D para salir.
 | `--batch-size 8` / `--ubatch-size 8` | 8 | El path slotted es batch=1; estos son defaults seguros. |
 | `--no-warmup` | on | El warmup default intenta armar un cgraph completo a través del modelo filtrado, lo que derefenciaría tensors NULL para layers no residentes. |
 
+La política del pool de hot-swap está en **pin-and-scratch** por default
+(introducida en el benchmark de FASE 4A-2b). Eso bajó 19% el runtime en
+MacBook Air M4 24GB con Llama 3.1 70B Q3_K_XL vs la legacy round-robin,
+con output idéntico y sin overhead de memoria. Para forzar el
+comportamiento legacy (A/B), corré `llama-cli` directo agregando
+`--slotted-round-robin`; el launcher no tiene flag para esto.
+
 Si necesitás apuntar el launcher a otra ruta de modelo, edita el macro
 `MODEL_REL` arriba de `poc.c`.
 

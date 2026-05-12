@@ -113,6 +113,13 @@ Press Enter on an empty line or Ctrl-D to exit.
 | `--batch-size 8` / `--ubatch-size 8` | 8 | The slotted path is batch=1; these are just safe defaults. |
 | `--no-warmup` | on | The default warmup path tries to build a full cgraph through the filtered model, which would dereference NULL tensors for non-resident layers. |
 
+The hot-swap pool policy defaults to **pin-and-scratch** (introduced in the
+4A-2b benchmark round). This reduced runtime by 19% on MacBook Air M4 24GB
+with Llama 3.1 70B Q3_K_XL versus the legacy round-robin policy, with
+identical output and no additional peak memory footprint. To force the
+legacy behaviour for A/B comparison, run `llama-cli` directly and add
+`--slotted-round-robin`; the launcher itself has no flag for it.
+
 If you need to point the launcher at a different model path, edit the
 `MODEL_REL` macro at the top of `poc.c`.
 

@@ -236,6 +236,45 @@ Estos flags viven en `common/arg.cpp` y son CLI-only (`LLAMA_EXAMPLE_CLI`).
 | `--slotted-decode-test` | Corre `llama_decode_slotted_test` (o `_real_test` si se combina con `--slotted-real`) sobre el prompt `-p`, samplea `-n` tokens greedy, imprime. |
 | `--slotted-decode-baseline` | Corre `llama_decode` normal sobre el mismo prompt y sampling para comparación. |
 | `--slotted-chat-poc` | Chat loop interactivo usando el runtime slotted-real. Lo usa `poc.c`. |
+| `--slotted-round-robin` | Opt-out de la política default pin-and-scratch del hot-swap; usar la legacy round-robin (`pool_idx = slot_idx % R`). Ver "Política del pool de hot-swap" abajo. |
+
+## Política del pool de hot-swap
+
+El runtime soporta dos políticas de reemplazo para el pool de buffers:
+
+- **`pin-and-scratch` (default, cuando `slots_resident >= 2`)**: pinea los
+  slots `0..R-2` en pools `0..R-2` durante toda la corrida; el pool `R-1`
+  es el scratch único que rota entre `slots R-1..N-1`. Los slots `0..R-2`
+  siempre dan hit. Steady-state de swaps por forward pass: `N - R + 1`.
+- **`round-robin` (legacy, opt-in con `--slotted-round-robin`)**: asigna
+  `pool_idx = slot_idx % R`. Cada steady-state pass re-swappea todos los
+  `N` slots porque el pool termina cada pass conteniendo los últimos `R`
+  slots accedidos. Steady-state de swaps por forward pass: `N`.
+
+Para nuestro workload de referencia (Llama 3.1 70B Q3_K_XL, `N=8`, `R=2`,
+prompt "The capital of France is", `-n 8`):
+
+| Métrica               | round-robin | pin-and-scratch | delta |
+|---|---:|---:|---:|
+| Total swaps           | 102 | 90 | -12 (-11.8%) |
+| Bytes leídos          | 425 GB | 375 GB | -50 GB (-11.8%) |
+| Suma read_ms          | 264.2 s | 195.0 s | -26.2% |
+| Suma set_ms           | 157.1 s | 68.7 s | -56.3% |
+| **Real time**         | **311.2 s** | **251.9 s** | **-59.3 s (-19.0%)** |
+| Peak memory footprint | 11,357 MB | 11,362 MB | idéntico |
+| OS swaps              | 0 | 0 | idéntico |
+| Texto generado        | `a city of love, art, fashion` | `a city of love, art, fashion` | idéntico |
+
+> pin-and-scratch is the default policy because it reduced runtime by 19%
+> on MacBook Air M4 24GB with Llama 3.1 70B Q3_K_XL, with identical output
+> and no additional peak memory footprint.
+
+La baja inesperadamente grande del `set_ms` (56% vs el 12% de bajada en
+cantidad de swaps) se debe a que round-robin escribe a **ambos** buffers del
+pool alternados, manteniendo ambos sets de páginas calientes en cache.
+Pin-and-scratch solo escribe al pool `R-1` después del init, así que las
+páginas del pool pineado pueden quedarse frías y hay menos competencia por
+cache del lado de escritura.
 
 ## Archivos
 
@@ -289,6 +328,11 @@ Resultado:   Generación coherente. Peak memory footprint ~11 GB consistente.
 Ejemplos: `Hello, my name is` → ` John and I am a 30-year-old` y
 `The capital of France is` → ` a city of love, art, fashion`.
 
+Los números de la fila FASE 4A-2b de la "Bitácora de fases" arriba se
+midieron con la policy legacy round-robin. Con la default pin-and-scratch
+el mismo run completa en 19% menos wall-clock en el mismo hardware (ver
+"Política del pool de hot-swap" abajo).
+
 ## Limitaciones conocidas
 
 1. **Layers heterogéneos rompen el hot-swap.** Modelos donde los shapes
@@ -327,11 +371,12 @@ Ejemplos: `Hello, my name is` → ` John and I am a 30-year-old` y
    por el load filter. Esto es intencional: el estado KV debe persistir a
    través de las rotaciones de slot dentro de un forward pass.
 
-7. **La asignación round-robin de pool es subóptima.** Cada forward pass
-   después del primero re-swappea cada slot. Una política simple LRU o
-   "mantener los slots residentes residentes" podría reducir swaps
-   significativamente. El código actual prioriza simplicidad sobre
-   performance.
+7. **Política de reemplazo del pool.** El default es `pin-and-scratch`
+   (pinear R-1 slots, usar 1 scratch); la legacy round-robin queda
+   disponible vía `--slotted-round-robin`. Ver "Política del pool de
+   hot-swap" para el trade-off medido. Ambas siguen siendo subóptimas vs
+   Belady (óptima para el patrón de acceso cíclico), pero el lookahead
+   estilo Belady no está implementado todavía.
 
 ## Disclosure
 

@@ -42,11 +42,26 @@ inline double ms_since(std::chrono::steady_clock::time_point t0) {
 
 } // namespace
 
+int slotted_hot_swap_pool_idx(const slotted_hot_swap_state & st, int slot_idx) {
+    // Pin-and-scratch needs at least R=2 to make sense (1 pin + 1 scratch).
+    if (st.policy == SLOTTED_POOL_PIN_SCRATCH && st.slots_resident >= 2) {
+        // Slots 0 .. R-2 stay pinned to their initial pool index.
+        if (slot_idx < st.slots_resident - 1) {
+            return slot_idx;
+        }
+        // Everything else uses the single scratch pool slot at index R-1.
+        return st.slots_resident - 1;
+    }
+    // Default / fallback: round-robin.
+    return slot_idx % st.slots_resident;
+}
+
 bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
                             llama_model * model,
                             const std::string & gguf_path,
                             const std::vector<std::pair<int,int>> & slot_ranges,
-                            int slots_resident) {
+                            int slots_resident,
+                            enum slotted_hot_swap_policy_t policy) {
     if (model == nullptr || gguf_path.empty() || slot_ranges.empty() || slots_resident <= 0) {
         LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
         return false;
@@ -61,6 +76,7 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
     st.gguf_path       = gguf_path;
     st.slot_ranges     = slot_ranges;
     st.slots_resident  = slots_resident;
+    st.policy          = policy;
 
     // Open GGUF read-only (separate fd from the loader's mmap/fread).
     st.gguf_fd = ::open(gguf_path.c_str(), O_RDONLY);
@@ -114,9 +130,10 @@ bool slotted_hot_swap_setup(slotted_hot_swap_state & st,
         }
     }
 
-    LLAMA_LOG_INFO("%s: hot-swap state ready: gguf='%s' fd=%d data_off=%llu tensors=%zu pools=%d\n",
+    const char * policy_name = (policy == SLOTTED_POOL_PIN_SCRATCH) ? "pin-scratch" : "round-robin";
+    LLAMA_LOG_INFO("%s: hot-swap state ready: gguf='%s' fd=%d data_off=%llu tensors=%zu pools=%d policy=%s\n",
             __func__, gguf_path.c_str(), st.gguf_fd,
-            (unsigned long long) st.gguf_data_base, st.gguf_tensors.size(), slots_resident);
+            (unsigned long long) st.gguf_data_base, st.gguf_tensors.size(), slots_resident, policy_name);
 
     return true;
 }
@@ -273,7 +290,8 @@ struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
                 const char * gguf_path,
                     int32_t  slot_layers,
                     int32_t  slot_size_mb,
-                    int32_t  slots_resident) {
+                    int32_t  slots_resident,
+                    int32_t  policy) {
     if (model == nullptr || gguf_path == nullptr) {
         LLAMA_LOG_ERROR("%s: null args\n", __func__);
         return nullptr;
@@ -337,8 +355,11 @@ struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
         LLAMA_LOG_INFO("%s:   slot[%zu] = layers %d..%d\n", __func__, i, ranges[i].first, ranges[i].second);
     }
 
+    enum slotted_hot_swap_policy_t pol =
+        (policy == 1) ? SLOTTED_POOL_PIN_SCRATCH : SLOTTED_POOL_ROUND_ROBIN;
+
     auto * hs = new llama_slotted_hot_swap;
-    if (!slotted_hot_swap_setup(hs->st, model, gguf_path, ranges, slots_resident)) {
+    if (!slotted_hot_swap_setup(hs->st, model, gguf_path, ranges, slots_resident, pol)) {
         delete hs;
         return nullptr;
     }

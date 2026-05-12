@@ -4075,7 +4075,7 @@ int llama_context::decode_slotted_real_test(
             const int il_end   = slot_ranges[s].second;
             const bool is_first = (il_start == 0);
             const bool is_final = (il_end   == n_layer - 1);
-            const int  pool_idx = (int) s % slots_resident;
+            const int  pool_idx = slotted_hot_swap_pool_idx(hs->st, (int) s);
             const bool need_swap = (hs->st.pool_current_slot[pool_idx] != (int) s);
 
             LLAMA_LOG_INFO("%s: -- slot %zu (layers %d..%d) pool=%d need_swap=%s\n",

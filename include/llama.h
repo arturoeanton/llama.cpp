@@ -658,12 +658,15 @@ extern "C" {
     // Constraints: text-only Gemma 4, --no-repack, batch_size 1.
     struct llama_slotted_hot_swap;
 
+    // policy: 0 = round-robin (pool_idx = slot_idx % R)
+    //         1 = pin-and-scratch (pins slots 0..R-2; pool R-1 is the scratch)
     LLAMA_API struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
             struct llama_model * model,
                     const char * gguf_path,
                         int32_t  slot_layers,
                         int32_t  slot_size_mb,
-                        int32_t  slots_resident);
+                        int32_t  slots_resident,
+                        int32_t  policy);
 
     // Make logical slot `slot_idx` resident in pool `pool_idx`. Returns 0 on
     // success, negative on error. No-op if the slot is already in that pool.

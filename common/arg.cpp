@@ -2351,6 +2351,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--slotted-round-robin"},
+        "experimental: FASE 4A-2b - opt out of the default pin-and-scratch hot-swap "
+        "policy and use the legacy round-robin one (pool_idx = slot_idx % R). "
+        "Default is pin-and-scratch (measured 19%% faster on 24GB Mac with Llama 3.1 70B).",
+        [](common_params & params) {
+            params.slotted_round_robin = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
