@@ -450,6 +450,10 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
+    // experimental (FASE 4A): per-layer load filter, forwarded to llama_model_params.
+    bool (*layer_filter)(int32_t il, void * user_data) = nullptr;
+    void * layer_filter_user_data                      = nullptr;
+
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
@@ -479,6 +483,21 @@ struct common_params {
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
+
+    // experimental: slotted inference instrumentation (see common/slotted-inference.h)
+    bool        slotted_test               = false;  // master switch; when false, no slotted code runs
+    int32_t     slot_layers                = 0;      // fixed number of layers per slot (priority over slot_size_mb)
+    int32_t     slot_size_mb               = 0;      // approximate slot size in MiB (used when slot_layers == 0)
+    bool        slotted_log                = false;  // verbose per-slot logging during decode
+    std::string slotted_json_path          = "";     // optional path to write summary JSON                 // NOLINT
+    bool        slotted_simulate_prefetch  = false;  // FASE 3: simulate async prefetch of next slot
+    int32_t     slotted_bandwidth_mb_s     = 0;      // FASE 3: target read bandwidth used by the sleep mode
+    std::string slotted_prefetch_mode      = "sleep"; // FASE 3: "sleep" | "dummy-read" (madvise is FASE 4)  // NOLINT
+    bool        slotted_real               = false;  // FASE 4A: load only resident slots' tensors (skips others)
+    int32_t     slots_resident             = 2;      // FASE 4A: number of slots to keep resident in RAM
+    bool        slotted_decode_test        = false;  // FASE 4A-2a: run llama_decode_slotted_test on a fixed prompt
+    bool        slotted_decode_baseline    = false;  // FASE 4A-2a: run normal llama_decode on the same prompt for comparison
+    bool        slotted_chat_poc           = false;  // FASE 4A-2b: interactive chat loop using the slotted-real runtime (demo)
 
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)

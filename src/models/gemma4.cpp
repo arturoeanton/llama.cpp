@@ -149,11 +149,37 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // experimental (FASE 4A-2): slotted graph construction.
+    // When params.slot_il_end < 0, behave exactly like the original full-graph
+    // builder (this is the path used by every non-slotted caller).
+    const int  slot_il_start = params.slot_il_end < 0 ? 0           : params.slot_il_start;
+    const int  slot_il_end   = params.slot_il_end < 0 ? n_layer - 1 : params.slot_il_end;
+    const bool slot_is_first = (slot_il_start == 0);
+    const bool slot_is_final = (slot_il_end   == n_layer - 1);
+    const bool slotted_mode  = !(slot_is_first && slot_is_final);
 
-    // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
-    cb(inpL, "inp_scaled", -1);
+    if (slotted_mode && model.per_layer_tok_embd) {
+        // Gemma's per-layer token-embedding path projects from tokens. With
+        // non-first slots there are no tokens available, only a hidden state.
+        // FASE 4A-2 demo is constrained to text-only Gemma 4 without that path.
+        GGML_ABORT("slotted graph does not support models with per_layer_tok_embd");
+    }
+
+    if (slot_is_first) {
+        // canonical path: build inpL from token embeddings + sqrt(n_embd) scaling
+        inpL = build_inp_embd(model.tok_embd);
+        inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+        cb(inpL, "inp_scaled", -1);
+    } else {
+        // slotted non-first slot: create the carry input tensor in THIS cgraph's
+        // ctx (so the scheduler sees it during sched_alloc_graph) and mark it as
+        // an input. The driver looks it up by name post-build and writes the
+        // previous slot's hidden state into it via ggml_backend_tensor_set.
+        inpL = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(inpL, "slot_inp_carry");
+        ggml_set_input(inpL);
+        cb(inpL, "slot_inp_carry", -1);
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -161,7 +187,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // TODO: is causal == true correct? might need some changes
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // inp_out_ids is only meaningful for the final slot. In non-final slots we
+    // skip building it entirely: building it registers a graph input whose
+    // tensor would have no buffer (since the cgraph doesn't reference it via
+    // get_rows), and `set_inputs()` would then crash trying to populate it.
+    ggml_tensor * inp_out_ids = slot_is_final ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -172,7 +202,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = slot_il_start; il <= slot_il_end; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
 
@@ -245,7 +275,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        if (il == n_layer - 1 && inp_out_ids) {
+        // (slotted): only the FINAL slot strips, since intermediate slots must
+        // produce a full-width hidden state to pass to the next slot.
+        if (il == slot_il_end && slot_is_final && inp_out_ids) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -372,24 +404,33 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, nullptr,
-            LLM_NORM_RMS, -1);
+    if (slot_is_final) {
+        // canonical path: output_norm + lm_head -> logits
+        cur = build_norm(cur,
+                model.output_norm, nullptr,
+                LLM_NORM_RMS, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
+        // lm_head
+        cur = build_lora_mm(model.output, cur);
 
-    if (hparams.f_final_logit_softcapping) {
-        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-        cur = ggml_tanh(ctx0, cur);
-        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        if (hparams.f_final_logit_softcapping) {
+            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+            cur = ggml_tanh(ctx0, cur);
+            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        }
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    } else {
+        // slotted intermediate slot: expose the last-layer hidden state so the
+        // caller can ggml_backend_tensor_get() it and feed it into the next slot.
+        ggml_set_output(cur);
+        cb(cur, "slot_out_hidden", -1);
+        res->t_embd = cur;
     }
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
 }

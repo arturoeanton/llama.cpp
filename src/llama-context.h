@@ -134,6 +134,20 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // experimental (FASE 4A-2a): slotted decode for testing.
+    // Generates logits by splitting the transformer into per-slot cgraphs and
+    // transferring the hidden state through a CPU staging buffer. Only Gemma 4
+    // text-only is supported in FASE 4A-2a; all weights must be resident.
+    int decode_slotted_test(const llama_batch & batch_inp,
+                            const std::vector<std::pair<int,int>> & slot_ranges);
+
+    // experimental (FASE 4A-2b): slotted decode with on-demand hot-swap.
+    // Like decode_slotted_test but uses the supplied hot-swap state to make
+    // each logical slot resident before building its cgraph. Pool assignment
+    // is round-robin: logical slot K goes into pool (K % slots_resident).
+    int decode_slotted_real_test(const llama_batch & batch_inp,
+                                 struct llama_slotted_hot_swap * hs);
+
     //
     // state save/load
     //

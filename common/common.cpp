@@ -1404,6 +1404,14 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
+    // FASE 4A-2b: slotted-real contexts cannot service a generic llama_decode
+    // probe (the model has NULL tensors for non-resident layers). Assume the
+    // optimistic answer; the caller takes responsibility for using the slotted
+    // decode path.
+    if (llama_context_slotted_real_active(ctx)) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    }
+
     common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 
     llama_memory_clear(mem, true);
@@ -1482,6 +1490,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
 
+    // FASE 4A: forward the optional per-layer load filter.
+    mparams.layer_filter                = params.layer_filter;
+    mparams.layer_filter_user_data      = params.layer_filter_user_data;
+
     return mparams;
 }
 
@@ -1514,6 +1526,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    // FASE 4A-2b: when the model is loaded with the slotted filter AND the
+    // decode path will go through the slotted graph, the global sched_reserve()
+    // must be skipped because it would try to build a full cgraph through layers
+    // whose tensors are NULL.
+    cparams.slotted_real_skip_sched_reserve =
+        params.slotted_real && (params.slotted_decode_test || params.slotted_chat_poc);
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

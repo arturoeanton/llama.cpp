@@ -519,8 +519,12 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        bool (*layer_filter_)(int32_t il, void * user_data),
+        void * layer_filter_user_data_)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    this->layer_filter           = layer_filter_;
+    this->layer_filter_user_data = layer_filter_user_data_;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1106,6 +1110,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             size_data -= nbytes;
             n_created++;
 
+            return nullptr;
+        }
+
+        // experimental (slotted inference, FASE 4A): per-layer load filter.
+        // For layer-bound tensors only (tn.bid >= 0). Non-layer tensors (embeddings,
+        // final norm, lm_head) are always loaded since the graph needs them in all
+        // forward passes regardless of slot.
+        //
+        // We skip TENSOR_DUPLICATED here: those are aliases (e.g. rope_freqs which
+        // is shared across layers via a `bid`-less name template) and the outer
+        // create_tensor's duplicate-lookup path won't bump n_created -- so neither
+        // should we, otherwise done_getting_tensors() trips on a count mismatch.
+        if (layer_filter && tn.bid >= 0 && !(flags & TENSOR_DUPLICATED) &&
+                !layer_filter(tn.bid, layer_filter_user_data)) {
+            const size_t nbytes = ggml_nbytes(t_meta);
+            n_layer_tensors_skipped++;
+            bytes_layer_tensors_skipped += nbytes;
+            size_data -= nbytes;
+            n_created++;
             return nullptr;
         }
 

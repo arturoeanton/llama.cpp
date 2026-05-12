@@ -100,6 +100,8 @@ add_library(${TARGET}
     regex-partial.h
     sampling.cpp
     sampling.h
+    slotted-inference.cpp
+    slotted-inference.h
     speculative.cpp
     speculative.h
     unicode.cpp

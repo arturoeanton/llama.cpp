@@ -319,6 +319,13 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+
+        // experimental (slotted inference, FASE 4A): per-layer load filter.
+        // invoked once per layer-bound tensor (block_id >= 0) before allocation.
+        // returning false skips the tensor entirely (model.layers[il].* will be NULL).
+        // non-layer tensors (block_id == -1) are not filtered. NULL = load all (default).
+        bool (*layer_filter)(int32_t il, void * user_data);
+        void * layer_filter_user_data;
     };
 
     struct llama_sampler_seq_config {
@@ -374,6 +381,12 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // experimental (FASE 4A-2b): skip the global sched_reserve() done during
+        // context construction. Required when the model has NULL weight tensors
+        // for non-resident layers (slotted-real load filter). The per-slot
+        // decode path handles its own allocation.
+        bool slotted_real_skip_sched_reserve;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -601,6 +614,80 @@ extern "C" {
 
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
+
+    // experimental: total weight bytes of the transformer block at index `il`.
+    // optionally writes attention / FFN sub-totals through the out pointers.
+    // the remainder (norms, ssm, ...) is `return_value - attn - ffn`.
+    // returns 0 if `il` is out of range or no tensor matches `blk.<il>.`.
+    LLAMA_API uint64_t llama_model_layer_weight_bytes(
+            const struct llama_model * model,
+                          int32_t       il,
+                         uint64_t *     out_attn_bytes,
+                         uint64_t *     out_ffn_bytes);
+
+    // experimental: total weight bytes of model tensors that do NOT belong to
+    // any transformer block (token embeddings, final norm, lm_head, ...).
+    LLAMA_API uint64_t llama_model_non_layer_weight_bytes(const struct llama_model * model);
+
+    // experimental (FASE 4A-2a): slotted decode test path.
+    // Decodes `batch` by splitting the transformer layers into slots and running
+    // a separate cgraph per slot, transferring the hidden state through a CPU
+    // staging buffer. Logits are written to the context's standard output buffer
+    // so llama_get_logits() / llama_get_logits_ith() work as usual afterwards.
+    //
+    // Constraints (FASE 4A-2a):
+    //   - text-only Gemma 4 (no per_layer_tok_embd, no encoder)
+    //   - batch size 1
+    //   - all layer tensors must already be resident (no hot-swap yet)
+    //
+    // Grouping rule (matching common_slotted_build_plan):
+    //   - if slot_layers  > 0 : fixed number of layers per slot
+    //   - else if slot_size_mb > 0 : approximate slot size in MiB
+    //   - else                : a single slot containing all layers (= baseline)
+    //
+    // Returns 0 on success, negative on failure.
+    LLAMA_API int32_t llama_decode_slotted_test(
+            struct llama_context * ctx,
+                  struct llama_batch    batch,
+                            int32_t     slot_layers,
+                            int32_t     slot_size_mb);
+
+    // experimental (FASE 4A-2b): slotted hot-swap runtime.
+    // The runtime maintains a buffer pool of `slots_resident` physical slots and
+    // streams non-resident slot weights from `gguf_path` into the pool on demand.
+    // Constraints: text-only Gemma 4, --no-repack, batch_size 1.
+    struct llama_slotted_hot_swap;
+
+    LLAMA_API struct llama_slotted_hot_swap * llama_slotted_hot_swap_init(
+            struct llama_model * model,
+                    const char * gguf_path,
+                        int32_t  slot_layers,
+                        int32_t  slot_size_mb,
+                        int32_t  slots_resident);
+
+    // Make logical slot `slot_idx` resident in pool `pool_idx`. Returns 0 on
+    // success, negative on error. No-op if the slot is already in that pool.
+    LLAMA_API int32_t llama_slotted_hot_swap_swap_in(
+            struct llama_slotted_hot_swap * hs,
+                                  int32_t   slot_idx,
+                                  int32_t   pool_idx);
+
+    LLAMA_API void llama_slotted_hot_swap_free(struct llama_slotted_hot_swap * hs);
+
+    // Returns true if the context was created with slotted_real_skip_sched_reserve.
+    // Callers should treat such contexts as "do not run probe / warmup decodes
+    // through the standard path -- only the slotted hot-swap decode is valid".
+    LLAMA_API bool llama_context_slotted_real_active(const struct llama_context * ctx);
+
+    // Decode using the slotted graph path AND the hot-swap runtime. For each
+    // logical slot in the plan, ensures it is resident (hot-swapping if needed)
+    // before building/computing its cgraph. After all slots, copies logits into
+    // the context output buffer so llama_get_logits_ith() works as for normal
+    // decode. Returns 0 on success, negative on failure.
+    LLAMA_API int32_t llama_decode_slotted_real_test(
+            struct llama_context           * ctx,
+                  struct llama_batch         batch,
+            struct llama_slotted_hot_swap  * hs);
 
     // Returns true if the model contains an encoder that requires llama_encode() call
     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);

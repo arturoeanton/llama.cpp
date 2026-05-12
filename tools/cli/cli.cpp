@@ -3,7 +3,10 @@
 #include "arg.h"
 #include "console.h"
 #include "fit.h"
-// #include "log.h"
+#include "log.h"
+#include "slotted-inference.h"
+
+#include <sys/resource.h>
 
 #include "server-common.h"
 #include "server-context.h"
@@ -13,6 +16,7 @@
 #include <atomic>
 #include <algorithm>
 #include <filesystem>
+#include <iostream>
 #include <fstream>
 #include <thread>
 #include <signal.h>
@@ -359,6 +363,121 @@ int main(int argc, char ** argv) {
         console::error("please use llama-completion instead\n");
     }
 
+    // experimental: FASE 3 — wire the slotted-inference eval callback BEFORE the
+    // model is loaded, so the llama_context picks it up via common_params.
+    // The runtime is initialized below, once the model and slot plan exist.
+    common_slot_runtime slotted_rt;
+    if (params.slotted_test) {
+        params.cb_eval           = common_slotted_cb_eval;
+        params.cb_eval_user_data = &slotted_rt;
+    }
+
+    // experimental: FASE 4A — slotted-real path.
+    //
+    // FASE 4A-1: load filtered model, report peak RSS, exit. Bypass cli_context.
+    // FASE 4A-2b: when combined with --slotted-decode-test, install the layer
+    //   filter on params and fall through to the normal cli_context path. The
+    //   context constructor's sched_reserve becomes a no-op via cparams.
+    //   slotted_real_skip_sched_reserve (set in common_context_params_to_llama).
+    //
+    // These need to outlive load_model, so we keep them in main's scope.
+    static common_slot_plan         g_slotted_real_plan;
+    static common_slot_filter_state g_slotted_real_filter_state;
+    if (params.slotted_real) {
+        if (params.slot_layers <= 0 && params.slot_size_mb <= 0) {
+            console::error("--slotted-real requires --slot-layers or --slot-size-mb\n");
+            return 1;
+        }
+        if (params.slots_resident <= 0) {
+            console::error("--slots-resident must be > 0\n");
+            return 1;
+        }
+        g_slotted_real_plan = common_slotted_build_plan_from_gguf(params.model.path, params);
+        if (!g_slotted_real_plan.enabled) {
+            console::error("--slotted-real: failed to build plan from GGUF\n");
+            return 1;
+        }
+        g_slotted_real_filter_state.plan           = &g_slotted_real_plan;
+        g_slotted_real_filter_state.slots_resident = params.slots_resident;
+
+        params.layer_filter           = common_slotted_layer_filter_cb;
+        params.layer_filter_user_data = &g_slotted_real_filter_state;
+        params.fit_params             = false;
+
+        if (params.slotted_decode_test || params.slotted_chat_poc) {
+            // FASE 4A-2b extras: disable repack so raw GGUF bytes can be hot-swapped
+            // into the pool's buffers, and rely on slotted_real_skip_sched_reserve
+            // (derived in common_context_params_to_llama from these two flags).
+            params.no_extra_bufts = true;
+            LOG("[slotted-real-4A-2b] forcing --no-repack (no_extra_bufts=true) and skip_sched_reserve\n");
+        }
+    }
+
+    // FASE 4A-1 path: load only, measure RSS, and exit before context creation.
+    if (params.slotted_real && !params.slotted_decode_test && !params.slotted_decode_baseline && !params.slotted_chat_poc) {
+        common_slot_plan & plan = g_slotted_real_plan;
+        llama_model_params mparams = common_model_params_to_llama(params);
+        mparams.layer_filter           = common_slotted_layer_filter_cb;
+        mparams.layer_filter_user_data = &g_slotted_real_filter_state;
+
+        llama_backend_init();
+        llama_numa_init(params.numa);
+
+        console::log(("\nLoading model (slotted-real, " +
+                      std::to_string(params.slots_resident) + "/" +
+                      std::to_string(plan.slots.size()) + " slots)... ").c_str());
+        console::spinner::start();
+        llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        console::spinner::stop();
+        console::log("\n");
+        if (model == nullptr) {
+            console::error("\nFailed to load the model (slotted-real)\n");
+            llama_backend_free();
+            return 1;
+        }
+
+        struct rusage ru = {};
+        getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+        const double peak_rss_mb = (double) ru.ru_maxrss / (1024.0 * 1024.0); // bytes on macOS
+#else
+        const double peak_rss_mb = (double) ru.ru_maxrss / 1024.0;            // KB on Linux
+#endif
+        const int nshow = (int) std::min<size_t>(params.slots_resident, plan.slots.size());
+        double resident_mb = 0;
+        for (int i = 0; i < nshow; ++i) {
+            resident_mb += (double) plan.slots[i].weight_bytes / (1024.0 * 1024.0);
+        }
+        common_slotted_print_plan(plan);
+        LOG("[slotted-real]\n");
+        LOG("  slots_resident          = %d / %zu\n", params.slots_resident, plan.slots.size());
+        LOG("  loaded slots            =");
+        for (int s = 0; s < nshow; ++s) {
+            const auto & sd = plan.slots[s];
+            LOG(" %d(%d..%d)", sd.slot_id, sd.layer_start, sd.layer_end);
+        }
+        LOG("\n");
+        LOG("  resident_weight_mb      = %.2f (sum of resident slots)\n", resident_mb);
+        LOG("  non_layer_weight_mb     = %.2f (embeddings + final norm + lm_head)\n",
+            (double) plan.non_layer_bytes / (1024.0 * 1024.0));
+        LOG("  expected_layer_ram_mb   = %.2f (resident + non-layer)\n",
+            resident_mb + (double) plan.non_layer_bytes / (1024.0 * 1024.0));
+        LOG("  peak_rss_mb             = %.2f\n", peak_rss_mb);
+        LOG("  page_reclaims           = %ld\n", (long) ru.ru_minflt);
+        LOG("  hard_page_faults        = %ld\n", (long) ru.ru_majflt);
+        LOG("  voluntary_ctx_switches  = %ld\n", (long) ru.ru_nvcsw);
+        LOG("  inference_supported     = no (FASE 4A-2 will add per-slot graph execution)\n");
+        if (!params.slotted_json_path.empty()) {
+            if (common_slotted_write_plan_json(plan, params.slotted_json_path)) {
+                LOG("slotted: wrote plan JSON to '%s'\n", params.slotted_json_path.c_str());
+            }
+        }
+
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
+
     // struct that contains llama context and inference
     cli_context ctx_cli(params);
 
@@ -396,6 +515,281 @@ int main(int argc, char ** argv) {
 
     console::spinner::stop();
     console::log("\n");
+
+    // experimental: FASE 4A-2b — interactive chat PoC over the slotted-real runtime.
+    // Each turn: read a line from stdin, tokenize, reset KV, run slotted decode,
+    // greedy-sample n_predict tokens, print. The hot-swap runtime is initialised
+    // ONCE so we only pay model-load cost once.
+    if (params.slotted_chat_poc) {
+        if (!params.slotted_real) {
+            console::error("--slotted-chat-poc requires --slotted-real\n");
+            return 1;
+        }
+        llama_context * lctx = ctx_cli.ctx_server.get_llama_context();
+        const llama_model * model = llama_get_model(lctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+
+        const int n_predict = std::max(1, (int) params.n_predict);
+
+        llama_slotted_hot_swap * hs = llama_slotted_hot_swap_init(
+                const_cast<llama_model *>(model),
+                params.model.path.c_str(),
+                params.slot_layers,
+                params.slot_size_mb,
+                params.slots_resident);
+        if (hs == nullptr) {
+            console::error("slotted-chat-poc: hot-swap init failed\n");
+            return 1;
+        }
+
+        LOG("\n");
+        LOG("=======================================================================\n");
+        LOG("  This is intentionally slow. It proves a 35GB 70B model can run\n");
+        LOG("  with a reduced memory footprint (~%d GB peak instead of full RAM).\n", 11);
+        LOG("  Each turn: %d tokens, ~%d seconds. KV is reset every turn.\n", n_predict, n_predict * 20);
+        LOG("  Type a prompt and press Enter. Empty line / Ctrl-D exits.\n");
+        LOG("=======================================================================\n");
+
+        std::string line;
+        int turn = 0;
+        while (true) {
+            fprintf(stdout, "\n> ");
+            fflush(stdout);
+            if (!std::getline(std::cin, line)) break;  // EOF / Ctrl-D
+            if (line.empty()) break;
+
+            ++turn;
+            LOG("\n[turn %d] prompt=\"%s\"\n", turn, line.c_str());
+
+            // Wipe KV cache so each turn starts from scratch.
+            llama_memory_clear(llama_get_memory(lctx), /*data=*/true);
+            llama_memory_seq_rm(llama_get_memory(lctx), 0, 0, -1);
+
+            std::vector<llama_token> prompt_tokens =
+                common_tokenize(vocab, line, /*add_special=*/true, /*parse_special=*/false);
+            if (prompt_tokens.empty()) {
+                LOG("[turn %d] empty tokenization, skipping\n", turn);
+                continue;
+            }
+
+            // Feed prompt one token at a time.
+            bool failed = false;
+            for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+                llama_token t = prompt_tokens[i];
+                llama_batch b = llama_batch_get_one(&t, 1);
+                if (llama_decode_slotted_real_test(lctx, b, hs) != 0) {
+                    console::error("slotted-chat-poc: prompt decode failed\n");
+                    failed = true;
+                    break;
+                }
+            }
+            if (failed) continue;
+
+            // Greedy-sample n_predict tokens.
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            std::string reply;
+            for (int step = 0; step < n_predict; ++step) {
+                const float * logits = llama_get_logits_ith(lctx, -1);
+                if (logits == nullptr) break;
+                int   argmax = 0;
+                float maxv   = logits[0];
+                for (int v = 1; v < n_vocab; ++v) {
+                    if (logits[v] > maxv) { maxv = logits[v]; argmax = v; }
+                }
+                std::string piece = common_token_to_piece(vocab, argmax);
+                reply += piece;
+                fprintf(stdout, "%s", piece.c_str());
+                fflush(stdout);
+                if (step + 1 < n_predict) {
+                    llama_token t = argmax;
+                    llama_batch b = llama_batch_get_one(&t, 1);
+                    if (llama_decode_slotted_real_test(lctx, b, hs) != 0) {
+                        console::error("\nslotted-chat-poc: gen decode failed\n");
+                        break;
+                    }
+                }
+            }
+            fprintf(stdout, "\n");
+            LOG("[turn %d] reply (%d tok): %s\n", turn, n_predict, reply.c_str());
+        }
+
+        llama_slotted_hot_swap_free(hs);
+        return 0;
+    }
+
+    // experimental: FASE 4A-2a — slotted decode test harness.
+    // Tokenises a fixed prompt and runs either the baseline path or the slotted
+    // path (or both), prints the top-1 logit + decoded text, and exits.
+    if (params.slotted_decode_test || params.slotted_decode_baseline) {
+        llama_context * lctx = ctx_cli.ctx_server.get_llama_context();
+        const llama_model * model = llama_get_model(lctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+
+        // Tokenise the prompt. Use `-p` if provided, else a small default.
+        // BOS is added so the setup matches conventional decode flow.
+        const std::string prompt = params.prompt.empty() ? std::string("Hola") : params.prompt;
+        std::vector<llama_token> tokens = common_tokenize(vocab, prompt, /*add_special=*/true, /*parse_special=*/false);
+        if (tokens.empty()) {
+            console::error("slotted-decode-test: tokenization produced no tokens\n");
+            return 1;
+        }
+        // FASE 4A-2a accepts batch_size == 1; we feed tokens one-by-one and
+        // only sample after the LAST token.
+        LOG("\n[slotted-decode-test] prompt=\"%s\" tokens=%zu\n", prompt.c_str(), tokens.size());
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            LOG("  token[%zu] = %d (%s)\n", i, (int) tokens[i],
+                common_token_to_piece(vocab, tokens[i]).c_str());
+        }
+
+        // n_predict comes from `-n` (default in common_params). We generate at
+        // least 1 token. Greedy sampling throughout.
+        const int n_predict = std::max(1, (int) params.n_predict);
+
+        // FASE 4A-2b: when --slotted-real is also active, initialise the hot-swap
+        // runtime. The slot plan inside `hs` matches the plan we used for the
+        // load-time filter (same flags -> same grouping).
+        llama_slotted_hot_swap * hs = nullptr;
+        if (params.slotted_real && params.slotted_decode_test) {
+            hs = llama_slotted_hot_swap_init(const_cast<llama_model *>(model),
+                                             params.model.path.c_str(),
+                                             params.slot_layers,
+                                             params.slot_size_mb,
+                                             params.slots_resident);
+            if (hs == nullptr) {
+                console::error("slotted-decode-test: hot-swap init failed\n");
+                return 1;
+            }
+            LOG("[slotted-real-4A-2b] hot-swap state initialised (slots_resident=%d)\n", params.slots_resident);
+        }
+
+        auto run_one_pass = [&](const char * tag, bool slotted) -> std::vector<llama_token> {
+            // Wipe KV cache between baseline and slotted runs so they start fresh.
+            llama_memory_clear(llama_get_memory(lctx), /*data=*/true);
+            llama_memory_seq_rm(llama_get_memory(lctx), 0, 0, -1);
+
+            auto decode_one = [&](llama_token tk) -> int {
+                llama_batch batch = llama_batch_get_one(&tk, 1);
+                if (slotted) {
+                    if (hs != nullptr) {
+                        return llama_decode_slotted_real_test(lctx, batch, hs);
+                    }
+                    return llama_decode_slotted_test(lctx, batch, params.slot_layers, params.slot_size_mb);
+                }
+                return llama_decode(lctx, batch);
+            };
+
+            // Feed the prompt tokens one-by-one.
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                const int rc = decode_one(tokens[i]);
+                if (rc != 0) {
+                    console::error(("[" + std::string(tag) + "] prompt decode failed at token " +
+                                    std::to_string(i) + " rc=" + std::to_string(rc) + "\n").c_str());
+                    return {};
+                }
+            }
+
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+            // Greedy sample n_predict tokens. After each sample, feed it back.
+            std::vector<llama_token> out;
+            out.reserve(n_predict);
+            llama_token tk = 0;
+            float       tk_logit = 0.0f;
+            for (int step = 0; step < n_predict; ++step) {
+                const float * logits = llama_get_logits_ith(lctx, -1);
+                if (logits == nullptr) {
+                    console::error("[%s] no logits available after step\n");
+                    return out;
+                }
+                int   argmax = 0;
+                float maxv   = logits[0];
+                for (int v = 1; v < n_vocab; ++v) {
+                    if (logits[v] > maxv) { maxv = logits[v]; argmax = v; }
+                }
+                tk       = argmax;
+                tk_logit = maxv;
+                out.push_back(tk);
+                const std::string piece = common_token_to_piece(vocab, tk);
+                LOG("[%s] step=%2d tok=%6d logit=%10.6f text=%s\n",
+                    tag, step, tk, tk_logit, piece.c_str());
+
+                // Feed the sampled token back as the next decode input. Skip on
+                // the LAST iteration to avoid an unused decode call.
+                if (step + 1 < n_predict) {
+                    const int rc = decode_one(tk);
+                    if (rc != 0) {
+                        console::error(("[" + std::string(tag) + "] gen decode failed at step " +
+                                        std::to_string(step) + " rc=" + std::to_string(rc) + "\n").c_str());
+                        return out;
+                    }
+                }
+            }
+            return out;
+        };
+
+        std::vector<llama_token> base_seq, slot_seq;
+        if (params.slotted_decode_baseline) {
+            base_seq = run_one_pass("baseline", /*slotted=*/false);
+        }
+        if (params.slotted_decode_test) {
+            slot_seq = run_one_pass("slotted ", /*slotted=*/true);
+        }
+
+        // If both ran, do a sequence-level comparison.
+        if (params.slotted_decode_baseline && params.slotted_decode_test) {
+            if ((int) base_seq.size() != n_predict || (int) slot_seq.size() != n_predict) {
+                LOG("[compare] truncated run: baseline=%zu slotted=%zu (expected %d)\n",
+                    base_seq.size(), slot_seq.size(), n_predict);
+            }
+            int n_match = 0;
+            const int n_cmp = (int) std::min(base_seq.size(), slot_seq.size());
+            for (int i = 0; i < n_cmp; ++i) {
+                if (base_seq[i] == slot_seq[i]) {
+                    ++n_match;
+                }
+            }
+            LOG("[compare] tokens matched = %d / %d (%.1f%%)\n",
+                n_match, n_cmp, n_cmp > 0 ? 100.0 * n_match / n_cmp : 0.0);
+            std::string text_base, text_slot;
+            for (auto t : base_seq) text_base += common_token_to_piece(vocab, t);
+            for (auto t : slot_seq) text_slot += common_token_to_piece(vocab, t);
+            LOG("[compare] baseline text: %s\n", text_base.c_str());
+            LOG("[compare] slotted  text: %s\n", text_slot.c_str());
+            if (n_match == n_cmp && n_cmp == n_predict) {
+                LOG("[compare] PASS: sequences are identical\n");
+            } else {
+                LOG("[compare] FAIL: sequences differ\n");
+                for (int i = 0; i < n_cmp; ++i) {
+                    if (base_seq[i] != slot_seq[i]) {
+                        LOG("           first divergence at step %d: baseline=%d slotted=%d\n",
+                            i, base_seq[i], slot_seq[i]);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (hs != nullptr) {
+            llama_slotted_hot_swap_free(hs);
+        }
+        return 0;
+    }
+
+    // experimental: slotted-inference (FASE 1+3) — plan, print, initialize runtime.
+    if (params.slotted_test) {
+        const llama_model * model = llama_get_model(ctx_cli.ctx_server.get_llama_context());
+        if (params.slot_layers <= 0 && params.slot_size_mb <= 0) {
+            LOG("slotted: --slotted-test set without --slot-layers or --slot-size-mb; "
+                "falling back to a single slot covering all layers\n");
+        }
+        common_slot_plan plan = common_slotted_build_plan(model, params);
+        common_slotted_print_plan(plan);
+        // FASE 3: initialize runtime. cb_eval is already wired to &slotted_rt above.
+        // After this returns successfully, the callback starts collecting timings.
+        if (!common_slotted_runtime_init(slotted_rt, std::move(plan), params, params.model.path)) {
+            LOG("slotted: runtime init failed; per-slot timing will be disabled\n");
+        }
+    }
 
     std::thread inference_thread([&ctx_cli]() {
         ctx_cli.ctx_server.start_loop();
@@ -647,6 +1041,19 @@ int main(int argc, char ** argv) {
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
+
+    // experimental: slotted-inference (FASE 3) — flush the last forward pass,
+    // print aggregated stats, and optionally write the summary JSON.
+    if (params.slotted_test) {
+        common_slotted_runtime_flush(slotted_rt);
+        common_slotted_print_summary(slotted_rt);
+        if (!params.slotted_json_path.empty()) {
+            if (common_slotted_write_summary_json(slotted_rt, params.slotted_json_path)) {
+                LOG("slotted: wrote summary JSON to '%s'\n", params.slotted_json_path.c_str());
+            }
+        }
+        common_slotted_runtime_shutdown(slotted_rt);
+    }
 
     return 0;
 }

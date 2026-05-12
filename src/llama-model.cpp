@@ -2097,6 +2097,8 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.layer_filter                =*/ nullptr,
+        /*.layer_filter_user_data      =*/ nullptr,
     };
 
     return result;
@@ -2421,6 +2423,81 @@ const char * llama_model_chat_template(const llama_model * model, const char * n
 
 uint64_t llama_model_n_params(const llama_model * model) {
     return model->n_elements();
+}
+
+// experimental: parse a tensor name of the form "blk.<N>.<rest>".
+// returns true and fills out_il / out_rest on match.
+static bool slotted_parse_blk_prefix(const std::string & name, int & out_il, std::string & out_rest) {
+    static const std::string prefix = "blk.";
+    if (name.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    size_t i = prefix.size();
+    int il = 0;
+    bool has_digit = false;
+    while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+        il = il * 10 + (name[i] - '0');
+        ++i;
+        has_digit = true;
+    }
+    if (!has_digit || i >= name.size() || name[i] != '.') {
+        return false;
+    }
+    out_il   = il;
+    out_rest = name.substr(i + 1);
+    return true;
+}
+
+uint64_t llama_model_layer_weight_bytes(
+        const llama_model * model,
+                  int32_t   il,
+                 uint64_t * out_attn_bytes,
+                 uint64_t * out_ffn_bytes) {
+    if (out_attn_bytes) *out_attn_bytes = 0;
+    if (out_ffn_bytes)  *out_ffn_bytes  = 0;
+    if (model == nullptr || il < 0) {
+        return 0;
+    }
+
+    uint64_t total = 0;
+    uint64_t attn  = 0;
+    uint64_t ffn   = 0;
+
+    for (const auto & kv : model->tensors_by_name) {
+        int         cur_il = -1;
+        std::string rest;
+        if (!slotted_parse_blk_prefix(kv.first, cur_il, rest)) continue;
+        if (cur_il != il) continue;
+
+        const uint64_t nb = (uint64_t) ggml_nbytes(kv.second);
+        total += nb;
+
+        // categorize: anything with "norm" in the suffix goes to the remainder,
+        // attn_* counts as attention, ffn_* / ffn_*_exps* counts as FFN.
+        if (rest.find("norm") != std::string::npos) {
+            // remainder
+        } else if (rest.compare(0, 4, "attn") == 0) {
+            attn += nb;
+        } else if (rest.compare(0, 3, "ffn") == 0) {
+            ffn += nb;
+        }
+    }
+
+    if (out_attn_bytes) *out_attn_bytes = attn;
+    if (out_ffn_bytes)  *out_ffn_bytes  = ffn;
+    return total;
+}
+
+uint64_t llama_model_non_layer_weight_bytes(const llama_model * model) {
+    if (model == nullptr) return 0;
+    uint64_t total = 0;
+    for (const auto & kv : model->tensors_by_name) {
+        int         cur_il = -1;
+        std::string rest;
+        if (slotted_parse_blk_prefix(kv.first, cur_il, rest)) continue;
+        total += (uint64_t) ggml_nbytes(kv.second);
+    }
+    return total;
 }
 
 bool llama_model_has_encoder(const llama_model * model) {

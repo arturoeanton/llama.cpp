@@ -2249,6 +2249,107 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_direct_io = value;
         }
     ).set_env("LLAMA_ARG_DIO"));
+    // experimental: slotted-inference instrumentation (FASE 1 = plan + log only, no math change)
+    add_opt(common_arg(
+        {"--slotted-test"},
+        "experimental: enable slotted-inference instrumentation (no math change in FASE 1)",
+        [](common_params & params) {
+            params.slotted_test = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slot-layers"}, "N",
+        "experimental: fixed number of transformer layers per slot (priority over --slot-size-mb)",
+        [](common_params & params, int value) {
+            params.slot_layers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slot-size-mb"}, "N",
+        "experimental: approximate slot size in MiB (used when --slot-layers is 0)",
+        [](common_params & params, int value) {
+            params.slot_size_mb = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-log"},
+        "experimental: verbose per-slot logging during decode (requires --slotted-test)",
+        [](common_params & params) {
+            params.slotted_log = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-json"}, "PATH",
+        "experimental: write slotted summary as JSON to PATH (requires --slotted-test)",
+        [](common_params & params, const std::string & value) {
+            params.slotted_json_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-simulate-prefetch"},
+        "experimental: FASE 3 - simulate async prefetch of the next slot in parallel with current compute",
+        [](common_params & params) {
+            params.slotted_simulate_prefetch = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-bandwidth-mb-s"}, "N",
+        "experimental: assumed read bandwidth in MiB/s (used by --slotted-prefetch-mode sleep)",
+        [](common_params & params, int value) {
+            params.slotted_bandwidth_mb_s = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-prefetch-mode"}, "MODE",
+        "experimental: prefetch simulation mode: 'sleep' (default) or 'dummy-read' "
+        "(reads bytes from the model file via a separate fd; madvise is FASE 4)",
+        [](common_params & params, const std::string & value) {
+            if (value != "sleep" && value != "dummy-read") {
+                throw std::invalid_argument("--slotted-prefetch-mode must be 'sleep' or 'dummy-read'");
+            }
+            params.slotted_prefetch_mode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    // FASE 4A: real partial load
+    add_opt(common_arg(
+        {"--slotted-real"},
+        "experimental: FASE 4A - load only N resident slots' weights (see --slots-resident). "
+        "Inference is NOT supported in this phase; the run exits after load + RSS measurement.",
+        [](common_params & params) {
+            params.slotted_real = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slots-resident"}, "N",
+        "experimental: number of slots to keep resident in RAM when --slotted-real is on (default: 2)",
+        [](common_params & params, int value) {
+            params.slots_resident = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    // FASE 4A-2a: chunked decode test
+    add_opt(common_arg(
+        {"--slotted-decode-test"},
+        "experimental: FASE 4A-2a - run llama_decode_slotted_test on the prompt, print top-1 token. "
+        "Requires Gemma 4 text-only and batch_size 1. All weights loaded.",
+        [](common_params & params) {
+            params.slotted_decode_test = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-decode-baseline"},
+        "experimental: FASE 4A-2a - run normal llama_decode on the prompt, print top-1 token (for comparison).",
+        [](common_params & params) {
+            params.slotted_decode_baseline = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--slotted-chat-poc"},
+        "experimental: FASE 4A-2b - interactive chat loop demo using the slotted-real runtime. "
+        "Requires --slotted-real. Reset KV per turn. Greedy sampling. Each turn = -n tokens.",
+        [](common_params & params) {
+            params.slotted_chat_poc = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"

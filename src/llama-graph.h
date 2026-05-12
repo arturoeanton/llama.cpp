@@ -568,6 +568,20 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // experimental (FASE 4A-2): slotted graph construction.
+    // When `slot_il_end >= 0`, the architecture's graph builder must only emit
+    // nodes for layers in [slot_il_start, slot_il_end]. Semantics:
+    //   - slot_il_start == 0           : build inpL from token embeddings (first slot)
+    //   - slot_il_start  > 0           : use `slot_inpL_carry` as the initial hidden state
+    //   - slot_il_end == n_layer - 1   : apply output_norm + lm_head (final slot)
+    //   - slot_il_end <  n_layer - 1   : expose the last layer's output via res->t_embd
+    // The `slot_inpL_carry` tensor must be writable by the caller (via
+    // ggml_backend_tensor_set) before the cgraph is computed.
+    // Default values keep the existing full-graph behaviour bit-for-bit identical.
+    int            slot_il_start    = 0;
+    int            slot_il_end      = -1;   // -1 => full range (= n_layer - 1)
+    ggml_tensor *  slot_inpL_carry  = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {

@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+#include "llama-slotted-runtime.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -164,6 +165,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.slotted_real_skip_sched_reserve = params.slotted_real_skip_sched_reserve;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -410,6 +412,15 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // experimental (FASE 4A-2b): in slotted-real mode the model has NULL weight
+    // tensors for non-resident layers, so the full-graph reservation below would
+    // dereference null. We still need gf_res_prev / sched objects (just created
+    // above); we skip only the actual graph build + reserve pass below.
+    if (cparams.slotted_real_skip_sched_reserve) {
+        LLAMA_LOG_INFO("%s: slotted-real -- skipping full graph reservation\n", __func__);
+        return;
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -3227,6 +3238,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.slotted_real_skip_sched_reserve =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -3767,6 +3779,470 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+// =========================================================================
+// FASE 4A-2a: slotted decode (test path).
+// =========================================================================
+//
+// This is a minimal driver that mirrors the parts of llama_context::decode()
+// we actually need: tokenization, batch init, KV cache setup, then a loop
+// over slots that builds and computes one cgraph per slot. The hidden state
+// is round-tripped through a CPU staging buffer between slots.
+//
+// Scope (FASE 4A-2a): batch_size 1, single sequence, Gemma 4 text-only, all
+// weights resident. No optimisation. The goal is to validate that per-slot
+// execution produces the same logits as the monolithic graph.
+
+int llama_context::decode_slotted_test(
+        const llama_batch & batch_inp,
+        const std::vector<std::pair<int,int>> & slot_ranges) {
+
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: slotted decode requires a KV cache (memory) -- not supported for this context\n", __func__);
+        return -1;
+    }
+    if (batch_inp.n_tokens == 0) {
+        LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+        return -1;
+    }
+    if (batch_inp.n_tokens != 1) {
+        LLAMA_LOG_ERROR("%s: FASE 4A-2a only supports batch_size 1 (got %d)\n", __func__, batch_inp.n_tokens);
+        return -1;
+    }
+    if (slot_ranges.empty()) {
+        LLAMA_LOG_ERROR("%s: slot_ranges is empty\n", __func__);
+        return -1;
+    }
+
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int    n_layer = (int) hparams.n_layer;
+    const int64_t n_embd_inp = hparams.n_embd_inp();
+    const int64_t n_embd     = hparams.n_embd;
+
+    if (slot_ranges.back().second != n_layer - 1) {
+        LLAMA_LOG_ERROR("%s: slot_ranges must cover all layers (last end = %d, n_layer = %d)\n",
+                __func__, slot_ranges.back().second, n_layer);
+        return -1;
+    }
+
+    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd_inp, n_seq_max, /*output_all=*/false)) {
+        LLAMA_LOG_ERROR("%s: failed to init batch\n", __func__);
+        return -1;
+    }
+
+    const uint32_t n_tokens_all  = balloc->get_n_tokens();
+    const uint32_t n_outputs_all = balloc->get_n_outputs();
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens_all;
+
+    embd_seq.clear();
+    output_swaps.clear();
+
+    sched_reserve();
+    memory_update(false);
+
+    llama_memory_context_ptr mctx_iter;
+    {
+        bool did_optimize = false;
+        while (true) {
+            mctx_iter = memory->init_batch(*balloc, cparams.n_ubatch, /*output_all=*/false);
+            if (!mctx_iter) {
+                return -2;
+            }
+            const auto st = mctx_iter->get_status();
+            if (st == LLAMA_MEMORY_STATUS_SUCCESS) break;
+            if (st == LLAMA_MEMORY_STATUS_FAILED_PREPARE && !did_optimize) {
+                did_optimize = true;
+                if (memory_update(true)) continue;
+            }
+            LLAMA_LOG_ERROR("%s: memory init failed (status %d)\n", __func__, (int) st);
+            return -2;
+        }
+    }
+
+    if (n_outputs_all > 0 && output_reserve(n_outputs_all) < (int32_t) n_outputs_all) {
+        LLAMA_LOG_ERROR("%s: failed to reserve output buffer\n", __func__);
+        return -2;
+    }
+    n_outputs = n_outputs_all;
+
+    // FASE 4A-2a: we expect exactly one ubatch since batch_size == 1.
+    uint32_t pos_out = 0;
+    do {
+        // Apply the memory context for this ubatch -- this updates KV positions.
+        // Without it, build_attn_inp_kv_iswa() inside each slot's cgraph reads
+        // stale state and produces wrong logits.
+        if (!mctx_iter->apply()) {
+            LLAMA_LOG_ERROR("%s: mctx apply failed\n", __func__);
+            return -3;
+        }
+
+        const auto & ubatch = mctx_iter->get_ubatch();
+
+        // CPU staging buffer for hidden state hand-off between slots.
+        std::vector<float> hidden(n_embd * ubatch.n_tokens, 0.0f);
+
+        for (size_t s = 0; s < slot_ranges.size(); ++s) {
+            const int  il_start  = slot_ranges[s].first;
+            const int  il_end    = slot_ranges[s].second;
+            const bool is_first  = (il_start == 0);
+            const bool is_final  = (il_end   == n_layer - 1);
+
+            auto * res = gf_res_prev.get();
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            // Build slot-aware params and the cgraph. For non-first slots the
+            // gemma4 builder will internally create a tensor named
+            // "slot_inp_carry" as the input hidden state.
+            auto gparams = graph_params(res, ubatch, mctx_iter.get(), LLM_GRAPH_TYPE_DEFAULT);
+            gparams.slot_il_start = il_start;
+            gparams.slot_il_end   = il_end;
+            // slot_inpL_carry is unused now (kept in struct for future variants).
+            gparams.slot_inpL_carry = nullptr;
+
+            auto * gf = model.build_graph(gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: slot %zu: failed to build graph\n", __func__, s);
+                return -3;
+            }
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: slot %zu: failed to alloc graph\n", __func__, s);
+                return -3;
+            }
+
+            // Standard input set (tokens for first slot, pos / attn / out_ids for all).
+            res->set_inputs(&ubatch);
+
+            // For non-first slots, write the previous slot's hidden state into
+            // the carry tensor. We look it up by name after the cgraph is built
+            // and the scheduler has allocated buffers for the inputs.
+            if (!is_first) {
+                ggml_tensor * carry = ggml_get_tensor(res->get_ctx(), "slot_inp_carry");
+                if (carry == nullptr) {
+                    LLAMA_LOG_ERROR("%s: slot %zu: 'slot_inp_carry' tensor not found in cgraph ctx\n", __func__, s);
+                    return -5;
+                }
+                ggml_backend_tensor_set(carry, hidden.data(), 0, hidden.size() * sizeof(float));
+            }
+
+            const auto status = graph_compute(gf, ubatch.n_tokens > 1);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: slot %zu: compute failed (status %d)\n", __func__, s, (int) status);
+                return -4;
+            }
+
+            if (!is_final) {
+                // Capture this slot's last-layer hidden state into the CPU staging buffer.
+                if (res->t_embd == nullptr) {
+                    LLAMA_LOG_ERROR("%s: slot %zu: t_embd is null (graph builder problem)\n", __func__, s);
+                    return -5;
+                }
+                ggml_backend_tensor_get(res->t_embd, hidden.data(), 0, hidden.size() * sizeof(float));
+            } else {
+                // Final slot: copy logits into the public output buffer so
+                // llama_get_logits() works as for normal decode.
+                if (res->t_logits == nullptr) {
+                    LLAMA_LOG_ERROR("%s: slot %zu: t_logits is null (graph builder problem)\n", __func__, s);
+                    return -5;
+                }
+                const int64_t n_vocab = vocab.n_tokens();
+                const int64_t n_outputs_ubatch = ubatch.n_tokens; // batch_size 1 -> one output
+                const size_t  bytes = (size_t) n_outputs_ubatch * n_vocab * sizeof(float);
+                if (logits.data == nullptr) {
+                    LLAMA_LOG_ERROR("%s: output buffer not allocated\n", __func__);
+                    return -5;
+                }
+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits);
+                GGML_ASSERT(backend_res != nullptr);
+                ggml_backend_tensor_get_async(backend_res, res->t_logits, logits.data + pos_out * n_vocab, 0, bytes);
+                pos_out += (uint32_t) n_outputs_ubatch;
+            }
+        }
+    } while (mctx_iter->next());
+
+    // Flush any pending async tensor reads.
+    ggml_backend_sched_synchronize(sched.get());
+
+    // Replicate decode_impl's output_ids mapping so llama_get_logits_ith() works.
+    n_outputs = n_outputs_all;
+    if (n_outputs > 0) {
+        auto & out_ids = balloc->get_out_ids();
+        GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
+        for (int64_t i = 0; i < n_outputs; ++i) {
+            output_ids[out_ids[i]] = (int32_t) i;
+        }
+    }
+
+    return 0;
+}
+
+// =========================================================================
+// FASE 4A-2b: slotted decode with hot-swap.
+// =========================================================================
+
+int llama_context::decode_slotted_real_test(
+        const llama_batch & batch_inp,
+        struct llama_slotted_hot_swap * hs) {
+
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: requires KV cache\n", __func__);
+        return -1;
+    }
+    if (hs == nullptr) {
+        LLAMA_LOG_ERROR("%s: hot-swap state is null\n", __func__);
+        return -1;
+    }
+    if (batch_inp.n_tokens != 1) {
+        LLAMA_LOG_ERROR("%s: FASE 4A-2b only supports batch_size 1 (got %d)\n", __func__, batch_inp.n_tokens);
+        return -1;
+    }
+
+    const auto & vocab   = model.vocab;
+    const auto & hparams = model.hparams;
+    const int    n_layer = (int) hparams.n_layer;
+    const int64_t n_embd_inp = hparams.n_embd_inp();
+    const int64_t n_embd     = hparams.n_embd;
+
+    const auto & slot_ranges    = hs->st.slot_ranges;
+    const int    slots_resident = hs->st.slots_resident;
+
+    if (slot_ranges.empty() || slot_ranges.back().second != n_layer - 1) {
+        LLAMA_LOG_ERROR("%s: slot plan must cover all layers\n", __func__);
+        return -1;
+    }
+    LLAMA_LOG_INFO("%s: starting slotted decode with %zu slots, %d resident\n",
+            __func__, slot_ranges.size(), slots_resident);
+
+    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd_inp, n_seq_max, false)) {
+        LLAMA_LOG_ERROR("%s: balloc init failed\n", __func__);
+        return -1;
+    }
+
+    const uint32_t n_tokens_all  = balloc->get_n_tokens();
+    const uint32_t n_outputs_all = balloc->get_n_outputs();
+    if (t_compute_start_us == 0) t_compute_start_us = ggml_time_us();
+    n_queued_tokens += n_tokens_all;
+
+    embd_seq.clear();
+    output_swaps.clear();
+    sched_reserve();   // becomes a no-op via cparams.slotted_real_skip_sched_reserve
+    memory_update(false);
+
+    llama_memory_context_ptr mctx_iter;
+    {
+        bool did_optimize = false;
+        while (true) {
+            mctx_iter = memory->init_batch(*balloc, cparams.n_ubatch, false);
+            if (!mctx_iter) return -2;
+            const auto status = mctx_iter->get_status();
+            if (status == LLAMA_MEMORY_STATUS_SUCCESS) break;
+            if (status == LLAMA_MEMORY_STATUS_FAILED_PREPARE && !did_optimize) {
+                did_optimize = true;
+                if (memory_update(true)) continue;
+            }
+            LLAMA_LOG_ERROR("%s: mctx init failed (status %d)\n", __func__, (int) status);
+            return -2;
+        }
+    }
+
+    if (n_outputs_all > 0 && output_reserve(n_outputs_all) < (int32_t) n_outputs_all) {
+        LLAMA_LOG_ERROR("%s: output_reserve failed\n", __func__);
+        return -2;
+    }
+    n_outputs = n_outputs_all;
+
+    uint32_t pos_out = 0;
+    do {
+        if (!mctx_iter->apply()) {
+            LLAMA_LOG_ERROR("%s: mctx_iter->apply failed\n", __func__);
+            return -3;
+        }
+
+        const auto & ubatch = mctx_iter->get_ubatch();
+        std::vector<float> hidden(n_embd * ubatch.n_tokens, 0.0f);
+
+        for (size_t s = 0; s < slot_ranges.size(); ++s) {
+            const int il_start = slot_ranges[s].first;
+            const int il_end   = slot_ranges[s].second;
+            const bool is_first = (il_start == 0);
+            const bool is_final = (il_end   == n_layer - 1);
+            const int  pool_idx = (int) s % slots_resident;
+            const bool need_swap = (hs->st.pool_current_slot[pool_idx] != (int) s);
+
+            LLAMA_LOG_INFO("%s: -- slot %zu (layers %d..%d) pool=%d need_swap=%s\n",
+                    __func__, s, il_start, il_end, pool_idx, need_swap ? "yes" : "no");
+
+            if (need_swap) {
+                // Make sure any prior cgraph compute that referenced this pool's tensors
+                // has fully finished before we overwrite their data.
+                LLAMA_LOG_INFO("%s: synchronizing sched before hot-swap\n", __func__);
+                ggml_backend_sched_synchronize(sched.get());
+                if (!slotted_hot_swap_swap_in(hs->st, (int) s, pool_idx)) {
+                    LLAMA_LOG_ERROR("%s: hot-swap failed for slot %zu\n", __func__, s);
+                    return -4;
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: slot %zu: about to reset gf_res_prev\n", __func__, s);
+            auto * res = gf_res_prev.get();
+            res->reset();
+            LLAMA_LOG_INFO("%s: slot %zu: gf_res reset OK, resetting sched\n", __func__, s);
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            LLAMA_LOG_INFO("%s: slot %zu: sched reset OK, building gparams\n", __func__, s);
+
+            auto gparams = graph_params(res, ubatch, mctx_iter.get(), LLM_GRAPH_TYPE_DEFAULT);
+            gparams.slot_il_start  = il_start;
+            gparams.slot_il_end    = il_end;
+            gparams.slot_inpL_carry = nullptr;
+
+            LLAMA_LOG_INFO("%s: slot %zu: about to build_graph\n", __func__, s);
+            auto * gf = model.build_graph(gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: slot %zu build_graph failed\n", __func__, s);
+                return -5;
+            }
+            LLAMA_LOG_INFO("%s: slot %zu: build_graph OK, alloc_graph\n", __func__, s);
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: slot %zu alloc_graph failed\n", __func__, s);
+                return -5;
+            }
+            LLAMA_LOG_INFO("%s: slot %zu: alloc_graph OK, set_inputs\n", __func__, s);
+
+            res->set_inputs(&ubatch);
+            LLAMA_LOG_INFO("%s: slot %zu: set_inputs OK\n", __func__, s);
+
+            if (!is_first) {
+                ggml_tensor * carry = ggml_get_tensor(res->get_ctx(), "slot_inp_carry");
+                if (carry == nullptr) {
+                    LLAMA_LOG_ERROR("%s: slot %zu missing slot_inp_carry\n", __func__, s);
+                    return -5;
+                }
+                ggml_backend_tensor_set(carry, hidden.data(), 0, hidden.size() * sizeof(float));
+            }
+
+            const auto status = graph_compute(gf, ubatch.n_tokens > 1);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: slot %zu compute failed (%d)\n", __func__, s, (int) status);
+                return -6;
+            }
+
+            if (!is_final) {
+                if (res->t_embd == nullptr) {
+                    LLAMA_LOG_ERROR("%s: slot %zu t_embd null\n", __func__, s);
+                    return -7;
+                }
+                ggml_backend_tensor_get(res->t_embd, hidden.data(), 0, hidden.size() * sizeof(float));
+            } else {
+                if (res->t_logits == nullptr) {
+                    LLAMA_LOG_ERROR("%s: final slot has t_logits == null\n", __func__);
+                    return -7;
+                }
+                const int64_t n_vocab = vocab.n_tokens();
+                const int64_t n_out_ub = ubatch.n_tokens;
+                const size_t  bytes = (size_t) n_out_ub * n_vocab * sizeof(float);
+                if (logits.data == nullptr) {
+                    LLAMA_LOG_ERROR("%s: output buffer null\n", __func__);
+                    return -7;
+                }
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits);
+                GGML_ASSERT(b != nullptr);
+                ggml_backend_tensor_get_async(b, res->t_logits, logits.data + pos_out * n_vocab, 0, bytes);
+                pos_out += (uint32_t) n_out_ub;
+            }
+        }
+    } while (mctx_iter->next());
+
+    ggml_backend_sched_synchronize(sched.get());
+
+    // Output ids mapping (same as decode_slotted_test).
+    n_outputs = n_outputs_all;
+    if (n_outputs > 0) {
+        auto & out_ids = balloc->get_out_ids();
+        GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
+        for (int64_t i = 0; i < n_outputs; ++i) {
+            output_ids[out_ids[i]] = (int32_t) i;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: hot-swap stats: swaps=%d bytes=%llu read_ms=%.2f set_ms=%.2f\n",
+            __func__,
+            hs->st.total_swaps,
+            (unsigned long long) hs->st.total_bytes_read,
+            hs->st.total_read_ms, hs->st.total_set_ms);
+
+    return 0;
+}
+
+int32_t llama_decode_slotted_real_test(
+        struct llama_context           * ctx,
+              struct llama_batch         batch,
+        struct llama_slotted_hot_swap  * hs) {
+    if (ctx == nullptr || hs == nullptr) return -1;
+    return ctx->decode_slotted_real_test(batch, hs);
+}
+
+bool llama_context_slotted_real_active(const struct llama_context * ctx) {
+    if (ctx == nullptr) return false;
+    return ctx->get_cparams().slotted_real_skip_sched_reserve;
+}
+
+int32_t llama_decode_slotted_test(
+        struct llama_context * ctx,
+              struct llama_batch    batch,
+                        int32_t     slot_layers,
+                        int32_t     slot_size_mb) {
+    if (ctx == nullptr) return -1;
+
+    // Build a simple in-process slot plan from the model. We reproduce the same
+    // grouping rules common_slotted_build_plan() uses so the API is consistent.
+    const llama_model * model = llama_get_model(ctx);
+    if (model == nullptr) return -1;
+
+    const int n_layer = llama_model_n_layer(model);
+    if (n_layer <= 0) return -1;
+
+    std::vector<std::pair<int,int>> slot_ranges;
+
+    if (slot_layers > 0) {
+        for (int il = 0; il < n_layer; il += slot_layers) {
+            const int end = std::min<int>(il + slot_layers, n_layer) - 1;
+            slot_ranges.emplace_back(il, end);
+        }
+    } else if (slot_size_mb > 0) {
+        const uint64_t target = (uint64_t) slot_size_mb * 1024ull * 1024ull;
+        uint64_t cur_bytes = 0;
+        int      cur_start = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            const uint64_t lb = llama_model_layer_weight_bytes(model, il, nullptr, nullptr);
+            const bool would_overflow = cur_bytes > 0 && cur_bytes + lb > target;
+            if (would_overflow) {
+                slot_ranges.emplace_back(cur_start, il - 1);
+                cur_start = il;
+                cur_bytes = 0;
+            }
+            cur_bytes += lb;
+        }
+        slot_ranges.emplace_back(cur_start, n_layer - 1);
+    } else {
+        // single slot covering all layers (= baseline)
+        slot_ranges.emplace_back(0, n_layer - 1);
+    }
+
+    const int rc = ctx->decode_slotted_test(batch, slot_ranges);
+    if (rc != 0) {
+        LLAMA_LOG_ERROR("%s: slotted decode failed, rc = %d\n", __func__, rc);
+    }
+    return rc;
 }
 
 //

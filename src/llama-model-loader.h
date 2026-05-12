@@ -90,6 +90,14 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
+    // experimental (slotted inference, FASE 4A): per-layer load filter.
+    // see llama_model_params.layer_filter for semantics.
+    bool (*layer_filter)(int32_t il, void * user_data) = nullptr;
+    void * layer_filter_user_data = nullptr;
+    // counters for diagnostic reporting (incremented when a tensor is skipped)
+    size_t n_layer_tensors_skipped = 0;
+    size_t bytes_layer_tensors_skipped = 0;
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
@@ -131,7 +139,10 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        // experimental (slotted inference, FASE 4A) -- may be nullptr
+        bool (*layer_filter)(int32_t il, void * user_data) = nullptr,
+        void * layer_filter_user_data = nullptr);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

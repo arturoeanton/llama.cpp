@@ -105,7 +105,23 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // experimental (FASE 4A-2): slotted graph construction.
+    // Defaults (params.slot_il_end == -1) preserve the original full-graph
+    // behaviour bit-for-bit for all non-slotted callers.
+    const int  slot_il_start = params.slot_il_end < 0 ? 0           : params.slot_il_start;
+    const int  slot_il_end   = params.slot_il_end < 0 ? n_layer - 1 : params.slot_il_end;
+    const bool slot_is_first = (slot_il_start == 0);
+    const bool slot_is_final = (slot_il_end   == n_layer - 1);
+
+    if (slot_is_first) {
+        inpL = build_inp_embd(model.tok_embd);
+    } else {
+        // Non-first slot: input is the carry tensor written by the driver.
+        inpL = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(inpL, "slot_inp_carry");
+        ggml_set_input(inpL);
+        cb(inpL, "slot_inp_carry", -1);
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -121,9 +137,11 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // Build inp_out_ids only for the final slot; non-final slots must produce
+    // full-width hidden state for the next slot (no row selection).
+    ggml_tensor * inp_out_ids = slot_is_final ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = slot_il_start; il <= slot_il_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -169,7 +187,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == slot_il_end && slot_is_final && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -226,19 +244,27 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     }
     cur = inpL;
 
-    cur = build_norm(cur,
-            model.output_norm, NULL,
-            LLM_NORM_RMS, -1);
+    if (slot_is_final) {
+        cur = build_norm(cur,
+                model.output_norm, NULL,
+                LLM_NORM_RMS, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    if constexpr (!embed) {
-        // lm_head
-        cur = build_lora_mm(model.output, cur);
+        if constexpr (!embed) {
+            // lm_head
+            cur = build_lora_mm(model.output, cur);
 
-        cb(cur, "result_output", -1);
-        res->t_logits = cur;
+            cb(cur, "result_output", -1);
+            res->t_logits = cur;
+        }
+    } else {
+        // Non-final slot: expose the last-layer hidden state so the driver can
+        // ggml_backend_tensor_get() it and feed it into the next slot.
+        ggml_set_output(cur);
+        cb(cur, "slot_out_hidden", -1);
+        res->t_embd = cur;
     }
 
     ggml_build_forward_expand(gf, cur);

@@ -40,6 +40,13 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // experimental (FASE 4A-2b): when true, the context skips the global
+    // sched_reserve() that would build a full-graph reservation. Slotted-real
+    // contexts have NULL weight tensors for non-resident layers, so the full
+    // build_graph would dereference null. The per-slot path in decode_slotted_test
+    // handles its own sched allocation slot-by-slot.
+    bool slotted_real_skip_sched_reserve = false;
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
