@@ -136,6 +136,23 @@ The hot-swap path re-reads roughly 30 GB per forward pass (8 slots minus the
 two residents, ~4.4 GB each). For long generations the OS page cache usually
 absorbs most of this; reported `block input operations` should stay low.
 
+## Cross-platform validation
+
+Both `poc` (70B Q3_K_XL) and `poc_tulu` (405B Q3_K_M) have also been
+smoke-tested on a **ThinkPad-class Intel Core i7 Evo laptop with 32 GB
+RAM** running Linux / x86_64. Both ran to completion with coherent
+output, no source changes required. Wall-clock was roughly **~2× the
+M4 24 GB target for 70B** and **~3× for 405B**, attributed to slower
+NVMe sustained throughput plus the AVX2 dispatch path being less
+optimised than the NEON `sdot` path for Q-quant `matmul` on Apple
+Silicon.
+
+The MacBook Air M4 24 GB stays the primary optimisation target. The
+x86 result is included here because it demonstrates that the
+slotted-real path itself is not tied to any one ISA or to Apple
+Silicon's unified-memory architecture — same binary, same flags,
+different machine, model runs.
+
 ## Limitations
 
 1. **Llama 3.1 family only.** Models with heterogeneous layer structure

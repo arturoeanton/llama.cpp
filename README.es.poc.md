@@ -137,6 +137,22 @@ El path de hot-swap re-lee aproximadamente 30 GB por forward pass (8 slots
 menos los 2 residentes, ~4.4 GB cada uno). Para generaciones largas el page
 cache del OS absorbe la mayoría; `block input operations` debería quedarse bajo.
 
+## Validación cross-platform
+
+Tanto `poc` (70B Q3_K_XL) como `poc_tulu` (405B Q3_K_M) se smoke-testearon
+también en una **laptop tipo ThinkPad Intel Core i7 Evo con 32 GB de RAM**
+corriendo Linux / x86_64. Los dos llegaron a fin con output coherente, sin
+cambios de código. El wall-clock fue aproximadamente **~2× del target M4
+24 GB para 70B** y **~3× para 405B**, atribuible al NVMe con throughput
+sostenido más bajo más el dispatch path AVX2 que está menos optimizado
+que el path NEON `sdot` para `matmul` Q-quant en Apple Silicon.
+
+La MacBook Air M4 24 GB sigue siendo el target principal de optimización.
+El resultado x86 se incluye acá porque demuestra que el path slotted-real
+en sí mismo no está atado a un ISA específico ni a la arquitectura de
+memoria unificada de Apple Silicon — mismo binario, mismos flags,
+máquina distinta, el modelo corre.
+
 ## Limitaciones
 
 1. **Solo familia Llama 3.1.** Modelos con estructura de layers heterogénea
